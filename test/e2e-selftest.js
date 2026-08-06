@@ -24,6 +24,14 @@
  *         （JPEG 近似ぼかし + 傾き + 汚れ）でも復元できるか。
  *  §10-3  クリーン画像で全版 x 全 ECC がラウンドトリップし、
  *         「A4 1 枚 10KB 前後」の到達版が復元できるか（複数ページ結合含む）。
+ *  §10-4  【実機フィードバック】全面均一劣化（ドットゲイン）への耐性。
+ *         局所汚れ(spots)には ECC で耐えるが、盤面全体が一律に太る/沈む
+ *         ドットゲインは固定しきい 128 の二値化を破綻させる（白セルまで黒判定）。
+ *         適応しきい化（大域 Otsu + 局所適応）で復元できることを確認する。
+ *  §10-5  【実機フィードバック】複合劣化の段階検証（level1〜3）。
+ *         単一劣化要因が各々通っても、複合すると閾値が破綻し得る。特に
+ *         level3（たわみ + 回転 1.3° + 強めぼかし + ドットゲイン）は
+ *         実機で失敗が判明したパターン。段階的に重畳して閾値耐性を検証する。
  *
  * §8「多値化禁止・二値固定・ブラウザ完結」を守るため、テストも DOM/Canvas に
  * 触れず、Node の生ピクセルバッファのみで完結する。
@@ -167,6 +175,93 @@ section('§10-2 複合劣化（JPEG近似ぼかし+傾き+帯ノイズ+汚れ）
     if (!r.match) { rotAll = false; console.log(`  MISS rotate ${deg}deg: ok=${r.ok} corr=${r.corrected}`); }
   }
   ok(rotAll, `微小傾き 0.2〜1.2° を全て復元（スキャナ想定レンジ）`);
+}
+
+// ==================================================================
+//  §10-4  全面均一劣化（ドットゲイン）への耐性
+// ------------------------------------------------------------------
+//  実機検証で判明: 局所劣化（汚れ）には強いが、全面一律の劣化（ドットゲイン
+//  ＝インク/トナー滲みで盤面全体の黒が太り、白背景まで沈む）に弱かった。
+//  原因は「固定しきい 128」でのセル二値化。白背景の輝度が 128 を割ると
+//  全白セルが黒と誤判定され、一度に半数近いセルが反転して ECC 能力を超える。
+//  対策として適応しきい化（大域 Otsu + 局所適応、decode-core.js sampleModules）
+//  を導入した。ここでは「白背景が 128 を大きく下回るほど暗化した」全面
+//  ドットゲインでも復元できること、および段階的に強めても破綻しないことを
+//  確認する（＝固定しきいなら flips≈49% で確実に失敗する条件）。
+// ==================================================================
+section('§10-4 全面均一劣化（ドットゲイン）への適応しきい耐性');
+{
+  const version = 2, ecc = 3;
+  const data = mkData(300, 4040);
+  // (a) 白背景が固定しきい 128 を大きく下回る「全面暗化」ドットゲイン。
+  //     blackFloor=30(黒の浮き) / whiteCeil=110(白の沈み) → 白まで <128。
+  //     固定しきいなら白セル全滅だが、適応しきいはヒストグラム平行移動に追従。
+  const uniform = (img) => R.dotGain(img, { growPx: 1, blackFloor: 30, whiteCeil: 110 });
+  const rU = roundtrip(version, ecc, data, uniform, true);
+  ok(rU.match, `全面暗化ドットゲイン(白→110<128) ver${version} ECC高 を復元 (corr=${rU.corrected})`);
+
+  // (b) 膨張量・暗化量を段階的に強めても復元できること（閾値の追従性）。
+  let dgAll = true;
+  const grid = [
+    { growPx: 0, blackFloor: 40, whiteCeil: 120 },
+    { growPx: 1, blackFloor: 30, whiteCeil: 105 },
+    { growPx: 2, blackFloor: 20, whiteCeil: 100 },
+    { growPx: 1, blackFloor: 45, whiteCeil: 115, bias: -12 },
+  ];
+  for (const g of grid) {
+    const r = roundtrip(version, ecc, data, (img) => R.dotGain(img, g), true);
+    if (!r.match) { dgAll = false; console.log(`  MISS dotGain ${JSON.stringify(g)}: ok=${r.ok} corr=${r.corrected}`); }
+  }
+  ok(dgAll, `ドットゲイン強度 4 段階（膨張×暗化）を全て復元（適応しきいの追従性）`);
+}
+
+// ==================================================================
+//  §10-5  複合劣化の段階検証（level1 → level2 → level3）
+// ------------------------------------------------------------------
+//  実機フィードバック: 単一劣化要因のテスト（傾きのみ・ぼかしのみ・ドット
+//  ゲインのみ 等）は各々通っていても、複合劣化での閾値検証が不足していた。
+//  とくに level3（たわみ + 回転 1.3° + 強めぼかし + ドットゲインの複合）で
+//  失敗が判明したため、劣化要因を段階的に重畳する複合パターンを追加する。
+//   level1: 回転 + 軽ぼかし（従来の単純劣化相当）
+//   level2: level1 + 中央たわみ（アライメントメッシュが効く帯域）
+//   level3: level2 の回転を 1.3° に強化 + 強めぼかし + 全面ドットゲイン
+//           （＝実機で破綻した複合。固定しきいなら白セル全滅で確実に失敗）
+//  すべて ECC 高（推奨運用）で復元できることを検証する。
+// ==================================================================
+section('§10-5 複合劣化の段階検証（level1→level2→level3、実機破綻パターン）');
+{
+  const version = 3, ecc = 3;                 // 中密度・ECC 高
+  const data = mkData(360, 5050);
+
+  // level1: 回転 0.8° + 軽ぼかし r=1
+  const level1 = (img) => R.blur(R.rotate(img, 0.8), 1);
+  const r1 = roundtrip(version, ecc, data, level1, true);
+  ok(r1.match, `level1（回転0.8°+軽ぼかし）を復元 (corr=${r1.corrected})`);
+
+  // level2: level1 + 中央たわみ k=0.010
+  const level2 = (img) => R.blur(R.rotate(R.warpCenterBulge(img, 0.010), 0.8), 1);
+  const r2 = roundtrip(version, ecc, data, level2, true);
+  ok(r2.match, `level2（level1+中央たわみ k=0.010）を復元 (corr=${r2.corrected})`);
+
+  // level3: たわみ + 回転 1.3° + 強めぼかし r=2 + 全面ドットゲイン（白→115<128）
+  //  ＝実機で失敗が判明した複合。適応しきい + アライメントメッシュで復元する。
+  const level3 = (img) => R.dotGain(
+    R.blur(R.rotate(R.warpCenterBulge(img, 0.010), 1.3), 2),
+    { growPx: 1, blackFloor: 35, whiteCeil: 115, bias: -8 });
+  const r3 = roundtrip(version, ecc, data, level3, true);
+  ok(r3.match, `level3（たわみ+回転1.3°+強めぼかし+ドットゲイン）を復元 (corr=${r3.corrected})`);
+
+  // level3 の複数版での安定性（単一版の偶然ではないことを担保）。
+  let l3All = true;
+  for (const v of [1, 2, 4]) {
+    const d = mkData(180, v * 31 + 3);
+    const l3 = (img) => R.dotGain(
+      R.blur(R.rotate(R.warpCenterBulge(img, 0.010), 1.3), 2),
+      { growPx: 1, blackFloor: 35, whiteCeil: 115, bias: -8 });
+    const r = roundtrip(v, 3, d, l3, true);
+    if (!r.match) { l3All = false; console.log(`  MISS level3 ver${v}: ok=${r.ok} corr=${r.corrected}`); }
+  }
+  ok(l3All, `level3 複合劣化を複数版（ver1/2/4）でも復元（複合閾値の一般性）`);
 }
 
 // ==================================================================

@@ -407,6 +407,29 @@
       ? (c, r) => meshMap(mesh, c, r)
       : (c, r) => mapper.map(c, r);
 
+    // ================================================================
+    //  §8/実機フィードバック: セル二値化の適応しきい化（ドットゲイン耐性）
+    // ----------------------------------------------------------------
+    //  以前は各セル平均を「固定しきい 128」で 0/1 判定していた。これは
+    //  「局所の汚れ」には ECC で耐えられる一方、**全面均一膨張＝ドットゲイン**
+    //  （インク/トナー滲み・濃いめ印刷・スキャナガンマ）に破綻する。盤面全域の
+    //  黒が一律に太り輝度が暗側へ寄ると、白セルまで 128 を割って黒と誤判定し、
+    //  一度に大量のセルが反転して ECC 能力を超えるためである。
+    //
+    //  対策は QR/文書二値化の定石に倣い、しきいを「画像内容から適応的に」決める:
+    //   (A) 大域 Otsu … まずセル平均値のヒストグラムから大津法でしきいを取る。
+    //       全面が一律に暗化しても黒山/白山ごと平行移動するので、しきいも一緒に
+    //       ずれて追従する（固定 128 が追従できない点をここで吸収）。
+    //   (B) 適応的局所しきい … 各セルの周囲 window 内のセル平均の局所平均から
+    //       バイアス C を引いた値をしきいにする（Sauvola/adaptive-mean 系）。
+    //       帯状ノイズや不均一な濃度ムラなど「場所ごとに濃さが違う」劣化に効く。
+    //   両者を統合し、局所窓が黒/白どちらかに偏って情報が乏しいときは (A) の大域
+    //   しきいへ寄せる。これで「均一ドットゲイン」「不均一ムラ」「クリーン」の
+    //   いずれでも安定して二値化できる。
+    // ================================================================
+
+    // --- パス1: 各セル平均輝度を収集（まだ二値化しない）----------------
+    const cellAvg = new Float32Array(cols * rows);
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const pt = mapCell(c, r);
@@ -420,13 +443,88 @@
             acc += g; cnt++;
           }
         }
-        const avg = cnt ? acc / cnt : 255;
-        modules[r * cols + c] = avg < 128 ? 1 : 0;
+        cellAvg[r * cols + c] = cnt ? acc / cnt : 255;
+      }
+    }
+
+    // --- (A) 大域 Otsu しきい（セル平均のヒストグラムから）--------------
+    const globalThr = otsuThresholdF(cellAvg);
+
+    // --- (B) 適応的局所しきい: 各セル周囲 window 内のセル平均の局所平均 ---
+    //  積分画像（summed-area table）で任意窓の局所平均を O(1) で引く。
+    //  窓半径 winR は概ね ±(数セル)。密度が上がっても比率で決める。
+    const winR = Math.max(2, Math.round(Math.min(cols, rows) / 12));
+    const sat = new Float64Array((cols + 1) * (rows + 1));
+    for (let r = 0; r < rows; r++) {
+      let rowSum = 0;
+      for (let c = 0; c < cols; c++) {
+        rowSum += cellAvg[r * cols + c];
+        sat[(r + 1) * (cols + 1) + (c + 1)] = sat[r * (cols + 1) + (c + 1)] + rowSum;
+      }
+    }
+    const winMean = (c, r) => {
+      const c0 = Math.max(0, c - winR), c1 = Math.min(cols - 1, c + winR);
+      const r0 = Math.max(0, r - winR), r1 = Math.min(rows - 1, r + winR);
+      const S = (rr, cc) => sat[rr * (cols + 1) + cc];
+      const area = (c1 - c0 + 1) * (r1 - r0 + 1);
+      const sum = S(r1 + 1, c1 + 1) - S(r0, c1 + 1) - S(r1 + 1, c0) + S(r0, c0);
+      return sum / area;
+    };
+
+    // --- パス2: 統合しきいで二値化 ------------------------------------
+    //  局所平均 lm から少しだけ暗側にバイアス（C）を引いた値を第一しきいに
+    //  用いる。ただし局所窓が大域 Otsu から見て黒/白のどちらかに大きく偏る
+    //  （＝情報が乏しい一様領域）ときは局所しきいが不安定なので、大域 Otsu へ
+    //  寄せて誤反転を防ぐ。C は輝度スケールの数%相当（全面ドットゲインでは
+    //  黒白コントラストが縮むため過大にしない）。
+    const C = 6;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const avg = cellAvg[r * cols + c];
+        const lm = winMean(c, r);
+        // 局所しきい（暗いほど 1）。lm から C を引き、暗い側の判定に厳しめ。
+        let thr = lm - C;
+        // 局所窓が一様（大域 Otsu から大きく離れた lm）なら大域しきいへ寄せる。
+        //  ブレンド係数 alpha は「局所平均が大域しきいからどれだけ離れているか」で
+        //  決め、離れているほど大域 Otsu を優先する。
+        const dev = Math.abs(lm - globalThr);
+        const alpha = Math.min(1, dev / 64);          // 0(近い)→1(遠い)
+        thr = thr * (1 - alpha) + globalThr * alpha;
+        modules[r * cols + c] = avg < thr ? 1 : 0;
       }
     }
     modules.__meshRefined = mesh ? mesh.refined : 0;
     modules.__meshTotal = mesh ? mesh.total : 0;
     return modules;
+  }
+
+  // セル平均（Float32Array, 0..255）に対する大津法。CF.otsuThreshold は
+  //  整数 gray 前提のため、ここでは連続値を 256bin に量子化して求める。
+  //  返り値は「黒山と白山の中点」（CF.otsuThreshold と同じ思想）。
+  function otsuThresholdF(vals) {
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < vals.length; i++) {
+      let v = vals[i] | 0; if (v < 0) v = 0; else if (v > 255) v = 255;
+      hist[v]++;
+    }
+    const total = vals.length;
+    let sumAll = 0;
+    for (let t = 0; t < 256; t++) sumAll += t * hist[t];
+    let sumB = 0, wB = 0, maxVar = -1, mBstar = 0, mFstar = 255;
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t];
+      if (wB === 0) continue;
+      const wF = total - wB;
+      if (wF === 0) break;
+      sumB += t * hist[t];
+      const mB = sumB / wB, mF = (sumAll - sumB) / wF;
+      const v = wB * wF * (mB - mF) * (mB - mF);
+      if (v > maxVar) { maxVar = v; mBstar = mB; mFstar = mF; }
+    }
+    let mid = (mBstar + mFstar) / 2;
+    if (!isFinite(mid)) mid = 128;
+    if (mid < 5 || mid > 250) mid = 128;
+    return mid;
   }
 
   // ==================================================================
