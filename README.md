@@ -1,2 +1,2 @@
-# SNCReader
+# SNCRevolution
 Naidesu-cardloaderの後続。
