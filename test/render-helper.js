@@ -111,6 +111,60 @@ function blur(img, radius) {
   return out;
 }
 
+// ---- 劣化: ドットゲイン（全面均一膨張）----------------------------
+//  実機のインク/トナー滲みや濃いめ印刷・スキャナのガンマで、盤面全域の黒が
+//  「一律に」太り・沈む現象。「局所の汚れ」(addNoise の spots) と違い、全面が
+//  同じだけ劣化するのが特徴。固定しきい 128 の二値化はこれに破綻しやすい
+//  （盤面全体の輝度分布が平行移動し、白セルまで固定しきいを割る）ため、
+//  適応しきい化（大域 Otsu + 局所適応）の耐性検証に用いる。
+//
+//  モデルは実機の 3 効果を合成する:
+//   (1) growPx … モルフォロジー膨張（min フィルタ）。黒セルが半径 growPx だけ
+//       周囲へにじみ出す（インク/トナーの物理的な太り）。
+//   (2) blackFloor / whiteCeil … 出力ダイナミックレンジの圧縮。実機では黒は
+//       完全な 0 にならず（blackFloor まで浮く）、紙白も 255 に届かない
+//       （whiteCeil まで沈む）。この「コントラスト縮小」が固定しきいを最も
+//       破綻させる主因。[0,255] を [blackFloor, whiteCeil] に線形写像する。
+//   (3) bias … 全面へ一律に足す明るさオフセット（負で全体を暗く）。スキャナ
+//       ガンマや濃いめ設定に相当。
+//  gain(後方互換) を渡した場合は暗部を gain 倍する旧挙動も併用する。
+function dotGain(img, opt) {
+  opt = opt || {};
+  const growPx = Math.max(0, Math.round(opt.growPx != null ? opt.growPx : 1));
+  const gain = opt.gain != null ? opt.gain : 1.0;        // >1 で暗部を強調（旧互換）
+  const blackFloor = opt.blackFloor != null ? opt.blackFloor : 0;    // 黒の浮き
+  const whiteCeil  = opt.whiteCeil  != null ? opt.whiteCeil  : 255;   // 白の沈み
+  const bias = opt.bias != null ? opt.bias : 0;          // 全面明るさオフセット
+  const { width: W, height: H } = img;
+  const src = img.data;
+  const out = { data: new Uint8ClampedArray(W * H * 4), width: W, height: H };
+  const span = Math.max(1, whiteCeil - blackFloor);
+  // 分離型 min フィルタ（暗い方＝黒が半径 growPx だけ膨張）。
+  const tmp = new Float32Array(W * H);
+  const lum = (x, y) => { const p = (y * W + x) * 4; return src[p]; }; // 描画はグレースケール
+  // 横方向 min
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let m = 255;
+    for (let d = -growPx; d <= growPx; d++) { const xx = x + d; if (xx < 0 || xx >= W) continue; const v = lum(xx, y); if (v < m) m = v; }
+    tmp[y * W + x] = m;
+  }
+  // 縦方向 min → gain → レンジ圧縮 → bias → 書き出し
+  for (let x = 0; x < W; x++) for (let y = 0; y < H; y++) {
+    let m = 255;
+    for (let d = -growPx; d <= growPx; d++) { const yy = y + d; if (yy < 0 || yy >= H) continue; const v = tmp[yy * W + x]; if (v < m) m = v; }
+    // gain>1: 暗部を一律に暗く沈める（旧挙動）。
+    let v = 255 - (255 - m) * gain;
+    // ダイナミックレンジ圧縮: [0,255] → [blackFloor, whiteCeil]。
+    v = blackFloor + (v / 255) * span;
+    // 全面バイアス。
+    v += bias;
+    v = v < 0 ? 0 : v > 255 ? 255 : v;
+    const p = (y * W + x) * 4;
+    out.data[p] = out.data[p + 1] = out.data[p + 2] = v; out.data[p + 3] = 255;
+  }
+  return out;
+}
+
 // ---- 劣化: 帯状ノイズ + 汚れ斑点 + 量子化ノイズ -------------------
 //  seed 固定の決定的 PRNG でテスト再現性を確保。
 function addNoise(img, opt, seed) {
@@ -141,4 +195,4 @@ function addNoise(img, opt, seed) {
   return out;
 }
 
-module.exports = { renderPage, sampleGray, warpCenterBulge, rotate, blur, addNoise };
+module.exports = { renderPage, sampleGray, warpCenterBulge, rotate, blur, dotGain, addNoise };
