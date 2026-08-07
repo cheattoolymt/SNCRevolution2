@@ -15,8 +15,22 @@
 const CF = require('../js/card-format.js');
 
 // フルサイズ（A4/300dpi）画像へ 1 ページを描画。scale で縮小して高速化。
-function renderPage(enc, scale) {
+//  opt.antialias=true で「被覆率アンチエイリアス」描画にする（既定 false）。
+//   ─ なぜ必要か（実機フィードバック §10-6）─
+//   これまでの描画は fillRect が整数座標のハード塗り（1px を黒/白の二値で
+//   埋める）だった。この場合セル境界がピクセル格子にきっちり乗り、しかも
+//   セル≒JPEG 8×8 ブロックなので、後段で実 JPEG コーデックを通しても
+//   ブロック DC（ブロック平均）が保たれ、リンギング/ブロックノイズが
+//   ほとんど出ない（＝机上では JPEG を通しても劣化しない）。しかし実機の
+//   canvas 描画はサブピクセル境界を**被覆率でアンチエイリアス**するため、
+//   セル縁は中間調になり、そこに JPEG の量子化リンギングが乗って隣接セルへ
+//   にじむ。これが「実 canvas JPEG は近似ぼかしより厳しい」の物理的正体。
+//   よって実 JPEG の厳しさを机上で再現するには、描画側も被覆率 AA にして
+//   セル縁に中間調を作る必要がある（二値“データ”は保つが“画素”は連続値）。
+function renderPage(enc, scale, opt) {
   scale = scale || 1;
+  opt = opt || {};
+  const antialias = !!opt.antialias;
   const W = Math.round(CF.PAGE_W * scale), H = Math.round(CF.PAGE_H * scale);
   const data = new Uint8ClampedArray(W * H * 4);
   for (let i = 0; i < data.length; i += 4) { data[i] = data[i + 1] = data[i + 2] = 255; data[i + 3] = 255; }
@@ -24,10 +38,35 @@ function renderPage(enc, scale) {
     x |= 0; y |= 0; if (x < 0 || y < 0 || x >= W || y >= H) return;
     const p = (y * W + x) * 4; data[p] = data[p + 1] = data[p + 2] = v;
   };
-  const fillRect = (x, y, w, h, v) => {
+  // 被覆率ブレンド: 画素 (x,y) を黒(v)で cover∈[0,1] だけ塗る（白地に合成）。
+  const blend = (x, y, v, cover) => {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+    const p = (y * W + x) * 4;
+    const nv = data[p] * (1 - cover) + v * cover;
+    data[p] = data[p + 1] = data[p + 2] = nv;
+  };
+  // ハード塗り（従来）。
+  const fillRectHard = (x, y, w, h, v) => {
     const x0 = Math.round(x), y0 = Math.round(y), x1 = Math.round(x + w), y1 = Math.round(y + h);
     for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) put(xx, yy, v);
   };
+  // アンチエイリアス塗り: [x,x+w]×[y,y+h] の実数矩形を、各画素の被覆率
+  //  （その画素 1×1 と矩形の重なり面積）でブレンドする。縁の画素だけ
+  //  中間調になり、実 canvas 描画のサブピクセル境界を模す。
+  const fillRectAA = (x, y, w, h, v) => {
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const x1 = Math.ceil(x + w), y1 = Math.ceil(y + h);
+    for (let yy = y0; yy < y1; yy++) {
+      const cy = Math.min(yy + 1, y + h) - Math.max(yy, y);
+      if (cy <= 0) continue;
+      for (let xx = x0; xx < x1; xx++) {
+        const cx = Math.min(xx + 1, x + w) - Math.max(xx, x);
+        if (cx <= 0) continue;
+        blend(xx, yy, v, Math.max(0, Math.min(1, cx * cy)));
+      }
+    }
+  };
+  const fillRect = antialias ? fillRectAA : fillRectHard;
   const prof = enc.prof;
   // 四隅ファインダ（塗りつぶし正方形）。creator.html と同一レイアウト。
   const half = CF.FINDER / 2;
@@ -165,6 +204,58 @@ function dotGain(img, opt) {
   return out;
 }
 
+// ---- 劣化: ドットゲイン（二値化先行 → 4 近傍膨張モデル）------------
+//  【実機フィードバック §10-9】上の dotGain() は「min フィルタ＋レンジ圧縮」
+//  でにじみを近似する“連続値”モデルで、実測では成長量 growPx=3.0（ver14/
+//  セル比 0.35）まで復元できていた。しかし実機のインク/トナーの染み込みは
+//  「まず紙面が黒/白に二値化され、その黒が物理的に周囲へ太る（膨張する）」
+//  離散プロセスに近い。この“二値化先行→膨張”を min フィルタ連続値モデルは
+//  再現できず（連続値は縁が中間調で寛容）、机上で実機の厳しさを過小評価する。
+//
+//  本関数はその実プロセスを忠実に再現する:
+//   (1) まず固定しきい thr（既定 128）で盤面を二値化（黒=1）。
+//   (2) その黒マスクを growPx 回だけ 4 近傍膨張（黒が上下左右へ 1px ずつ太る）。
+//       ＝インク/トナーの物理的なにじみ出し。連続値ではなく画素単位の離散膨張。
+//   (3) 出力ダイナミックレンジ圧縮 [blackFloor, whiteCeil]（黒は浮き・白は沈む）
+//       ＋全面バイアス bias（スキャナガンマ）。実機のコントラスト縮小を再現。
+//  growPx はここでは「膨張回数（=にじみ半径 px）」。セル比＝growPx / セル px。
+//  ver14 は 1 セル≒8.6px なので growPx3=セル比 0.35（min フィルタモデルの
+//  復元上限と同じ物理量）で比較できる。この二値化先行モデルでは同じセル比
+//  3.0 でも黒が白セルを侵食して破綻しやすく、実機の失敗を机上で捕捉できる。
+function dotGainBinary(img, opt) {
+  opt = opt || {};
+  const rounds = Math.max(0, Math.round(opt.growPx != null ? opt.growPx : 1));
+  const thr = opt.thr != null ? opt.thr : 128;
+  const blackFloor = opt.blackFloor != null ? opt.blackFloor : 0;
+  const whiteCeil  = opt.whiteCeil  != null ? opt.whiteCeil  : 255;
+  const bias = opt.bias != null ? opt.bias : 0;
+  const W = img.width, H = img.height, src = img.data;
+  // (1) 先に二値化（黒=1）。描画はグレースケールなので R チャネルで判定。
+  let bin = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) bin[i] = src[i * 4] < thr ? 1 : 0;
+  // (2) growPx 回の 4 近傍膨張（黒を上下左右へ 1px 太らせる）。
+  for (let it = 0; it < rounds; it++) {
+    const nb = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        if (bin[i]) { nb[i] = 1; continue; }
+        if ((x > 0 && bin[i - 1]) || (x < W - 1 && bin[i + 1]) ||
+            (y > 0 && bin[i - W]) || (y < H - 1 && bin[i + W])) nb[i] = 1;
+      }
+    }
+    bin = nb;
+  }
+  // (3) レンジ圧縮 + バイアスで書き出し（黒→blackFloor, 白→whiteCeil）。
+  const out = { data: new Uint8ClampedArray(W * H * 4), width: W, height: H };
+  for (let i = 0; i < W * H; i++) {
+    let v = (bin[i] ? blackFloor : whiteCeil) + bias;
+    v = v < 0 ? 0 : v > 255 ? 255 : v;
+    const p = i * 4; out.data[p] = out.data[p + 1] = out.data[p + 2] = v; out.data[p + 3] = 255;
+  }
+  return out;
+}
+
 // ---- 劣化: 帯状ノイズ + 汚れ斑点 + 量子化ノイズ -------------------
 //  seed 固定の決定的 PRNG でテスト再現性を確保。
 function addNoise(img, opt, seed) {
@@ -195,4 +286,55 @@ function addNoise(img, opt, seed) {
   return out;
 }
 
-module.exports = { renderPage, sampleGray, warpCenterBulge, rotate, blur, dotGain, addNoise };
+// ==================================================================
+//  幾何劣化の「順写像」点マッパ（内部アライメント検出テスト用）
+// ------------------------------------------------------------------
+//  warpCenterBulge / rotate は out(x,y)=source(finv(x,y)) の形（＝出力画素へ
+//  ソースを引き戻す inverse map）で定義されている。内部アライメント検出の
+//  精度を「劣化後の“真の”パターン中心」に対して測るには、逆に「ソース上の
+//  既知セル中心が、劣化後の出力画像の *どこ* に現れるか」＝順写像 forward が
+//  必要になる。ここではその forward を厳密に与える（blur/dotGain/addNoise は
+//  特徴位置を動かさないので恒等）。
+//
+//  【重要】これらは decode-core を一切使わない“地上の真値(ground truth)”で
+//  ある。テストがこの真値に対して検出誤差を測ることで、四隅ホモグラフィとは
+//  独立に「内部アライメント検出そのものの局所化精度」を検証できる。
+// ==================================================================
+
+// warpCenterBulge の順写像: ソース点 (sx,sy) → 出力点 (x,y)。
+//  inverse は sourceRay = c + (out-c)*(1+k*|out-c|^2/R^2)。半径方向へ単調なので
+//  出力半径 ρ を二分法で解く（|source-c| = ρ*(1+k*ρ^2/R^2)）。
+function bulgePointForward(W, H, k, sx, sy) {
+  const cx = W / 2, cy = H / 2, R = Math.hypot(cx, cy);
+  const vx = sx - cx, vy = sy - cy;
+  const srcR = Math.hypot(vx, vy);
+  if (srcR < 1e-9) return { x: cx, y: cy };
+  // 解く: srcR = rho * (1 + k*rho^2/R^2)  （rho = 出力半径, 単調増加）。
+  let lo = 0, hi = srcR;                 // f>=1 なので出力半径 <= ソース半径
+  for (let it = 0; it < 60; it++) {
+    const mid = (lo + hi) / 2;
+    const val = mid * (1 + k * mid * mid / (R * R));
+    if (val < srcR) lo = mid; else hi = mid;
+  }
+  const rho = (lo + hi) / 2;
+  const scale = rho / srcR;
+  return { x: cx + vx * scale, y: cy + vy * scale };
+}
+
+// rotate の順写像: ソース点 → 出力点。rotate の inverse は
+//  source = c + Rot(+deg)*(out-c) なので、forward は out = c + Rot(-deg)*(src-c)。
+function rotatePointForward(W, H, deg, sx, sy) {
+  const rad = deg * Math.PI / 180, cs = Math.cos(rad), sn = Math.sin(rad);
+  const cx = W / 2, cy = H / 2;
+  const dx = sx - cx, dy = sy - cy;
+  // inverse: sx = cx + dx'*cs + dy'*sn ; sy = cy - dx'*sn + dy'*cs  （dx'=out-c）
+  //  → out を解く（回転の逆行列 = 転置）。
+  const ox = dx * cs - dy * sn;
+  const oy = dx * sn + dy * cs;
+  return { x: cx + ox, y: cy + oy };
+}
+
+module.exports = {
+  renderPage, sampleGray, warpCenterBulge, rotate, blur, dotGain, dotGainBinary, addNoise,
+  bulgePointForward, rotatePointForward,
+};

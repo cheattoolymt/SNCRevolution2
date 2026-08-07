@@ -180,22 +180,69 @@
   //  最も相関の高い位置を中心とみなす。span は 1 セルの画像上サイズ(px)。
   //  相関では「黒であるべき画素の暗さ」-「白であるべき画素の暗さ」を足し込み、
   //  はっきりした同心構造ほど高スコアになる。見つからなければ null。
-  function refineAlignment(img, predicted, span, invert) {
+  //
+  //  【実機フィードバック §10-6/§10-7: 強ぼかし＋ドットゲイン耐性】
+  //  旧実装は棄却しきいを**絶対値**（相関 60・リングコントラスト 40）で
+  //  持っていた。しかし実機の JPEG 強ぼかし＋ドットゲインでは盤面の
+  //  ダイナミックレンジが圧縮され（黒白差が 255→80 程度に縮む）、同じ同心
+  //  マーカーでも相関値・リングコントラストが一律に小さくなる。絶対しきいは
+  //  この一律縮小に追従できず、「本物のアライメントを見落とす」（=内部
+  //  アライメント検出の崩壊。四隅は無事なのにメッシュが張れない実機症状）。
+  //  対策として、しきいを predicted 近傍の**実測ローカルコントラスト**で
+  //  正規化した相対値に変える。あわせて中心推定をスコア重み付き重心
+  //  （サブピクセル）にし、ぼかしで台地が広がっても中心が偏らないようにする。
+  //  【実機フィードバック §10-8: 内部アライメント検出の探索窓不足】
+  //  探索窓は既定 ±1.6 セルだが、中央たわみ（バレル歪み）では大域ホモグラフィ
+  //  予測からの真の乖離が **3〜5 セル** に達する（ver14/k=0.010 実測: mean 3.06
+  //  セル・max 5.20 セル）。固定 ±1.6 セルでは真の中心が窓外に出て 87% の
+  //  アライメントが原理的に見つからず、四隅は正確なのに内部検出が崩壊する
+  //  （＝ユーザ報告の level3 全版 MAGIC 不一致の正体）。そこで探索窓を
+  //  呼び出し側から `opt.winCells` で可変にし、buildControlMesh の粗→密
+  //  反復（まず広い窓でアンカーを拾い、近傍アンカーから予測を補正して狭い窓で
+  //  残りを拾う）で高検出率を得られるようにする。
+  function refineAlignment(img, predicted, span, invert, opt) {
+    opt = opt || {};
     const w = img.width, h = img.height;
     const cell = Math.max(1, (span.w + span.h) / 2);   // 1 セル ≒ px
-    const win = Math.max(2, Math.round(cell * 1.6));    // 探索窓（±1.6 セル）
+    const winCells = opt.winCells != null ? opt.winCells : 1.6;
+    const win = Math.max(2, Math.round(cell * winCells)); // 探索窓（±winCells セル）
     // 暗さ(0..255, 大きいほど暗い) を返すアクセサ。範囲外は「白」扱い。
+    //  ぼかしで 1px の量子化が効くため、サブピクセル位置は双一次で読む。
     const dark = (x, y) => {
-      if (x < 0 || y < 0 || x >= w || y >= h) return invert ? 255 : 0;
-      let v = grayAt(img, x | 0, y | 0);
-      if (invert) v = 255 - v;
+      if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return invert ? 255 : 0;
+      const x0 = x | 0, y0 = y | 0, tx = x - x0, ty = y - y0;
+      const gg = (xx, yy) => {
+        let v = grayAt(img, xx, yy);
+        return invert ? 255 - v : v;
+      };
+      const a = gg(x0, y0) * (1 - tx) + gg(x0 + 1, y0) * tx;
+      const b = gg(x0, y0 + 1) * (1 - tx) + gg(x0 + 1, y0 + 1) * tx;
+      const v = a * (1 - ty) + b * ty;
       return 255 - v; // 明度→暗さ
     };
+
+    // ---- ローカルコントラスト推定（相対しきいの基準）--------------------
+    //  predicted を中心に ±2.5 セルの暗さの min/max を取り、実効ダイナミック
+    //  レンジ range=max-min を得る。ドットゲインで range が縮んでも、しきいを
+    //  range 比で決めれば追従できる。range が極端に小さい（=情報が無い一様
+    //  領域）ときのみ棄却する。
+    let dMin = 255, dMax = 0;
+    const probeR = Math.max(2, Math.round(cell * 2.5));
+    for (let dy = -probeR; dy <= probeR; dy += Math.max(1, (cell / 2) | 0)) {
+      for (let dx = -probeR; dx <= probeR; dx += Math.max(1, (cell / 2) | 0)) {
+        const v = dark(predicted.x + dx, predicted.y + dy);
+        if (v < dMin) dMin = v; if (v > dMax) dMax = v;
+      }
+    }
+    const range = Math.max(1, dMax - dMin);
+    if (range < 18) return null;   // 事実上コントラスト無し（真に一様な領域）
+
     const cx0 = Math.round(predicted.x), cy0 = Math.round(predicted.y);
     // テンプレートを 1 点/セルで相関させると、パターン内部で score が「台地状」に
     // 平坦化する（各セルが一様塗りのため）。最大値を取る位置は台地の端に偏るので、
-    // ①まず最大スコアを求め、②その最大付近（台地）に属する位置の重心を中心とする。
-    let bestScore = -Infinity;
+    // ①まず最大スコアを求め、②その最大付近（台地）に属する位置をスコアで重み付け
+    // した重心をサブピクセル中心とする（ぼかし・レンジ圧縮に強い）。
+    let bestScore = -Infinity, worstScore = Infinity;
     const scores = new Float64Array((2 * win + 1) * (2 * win + 1));
     let k = 0;
     for (let dyc = -win; dyc <= win; dyc++) {
@@ -205,26 +252,35 @@
         for (const p of ALIGN_TEMPLATE) score += p.w * dark(cx + p.dx * cell, cy + p.dy * cell);
         scores[k++] = score;
         if (score > bestScore) bestScore = score;
+        if (score < worstScore) worstScore = score;
       }
     }
-    // 相関コントラストが弱い（=そこに同心マーカーが無い）場合は棄却。
-    if (bestScore < 60) return null;
-    // 台地重心（最大スコアの 92% 以上を「台地」とみなして平均）。
-    const thr = bestScore * 0.92;
-    let sx = 0, sy = 0, n = 0; k = 0;
+    // 相関コントラストの相対しきい: テンプレートは 13 暗点・12 明点なので、
+    //  理想の相関ピークは概ね range*13 のオーダー。実効レンジに対して十分な
+    //  ピーク・コントラストが立たなければ棄却する（絶対値 60 の相対版）。
+    const peakSpan = bestScore - worstScore;
+    if (bestScore < range * 5 || peakSpan < range * 4) return null;
+    // 台地（最大スコアの 90% 以上）をスコア重みで重心化＝サブピクセル中心。
+    const thr = worstScore + (bestScore - worstScore) * 0.90;
+    let sx = 0, sy = 0, sw = 0; k = 0;
     for (let dyc = -win; dyc <= win; dyc++) {
       for (let dxc = -win; dxc <= win; dxc++) {
-        if (scores[k++] >= thr) { sx += cx0 + dxc; sy += cy0 + dyc; n++; }
+        const sc = scores[k++];
+        if (sc >= thr) {
+          const wgt = sc - thr + 1e-6;
+          sx += (cx0 + dxc) * wgt; sy += (cy0 + dyc) * wgt; sw += wgt;
+        }
       }
     }
-    if (n === 0) return null;
-    const fx = sx / n, fy = sy / n;
+    if (sw === 0) return null;
+    const fx = sx / sw, fy = sy / sw;
 
     // ---- 構造の厳密検証（データ領域の“偶然の相関”を弾く）----------------
     //  相関スコアだけでは、データ領域が同心マーカーに似た瞬間に誤検出する
     //  （ECC0 では 1 セル誤りも命取り）。求めた中心で「中央=暗 / 半径1セル
     //  リング=明 / 半径2セルリング=暗」という二値構造が実際に成立するかを、
-    //  リングごとの平均コントラストで検証する。成立しなければ棄却。
+    //  リングごとの平均コントラストで検証する。しきいは絶対値ではなく実効
+    //  レンジ比（ドットゲインで縮んでも追従）で判定する。
     const D = (dx, dy) => dark(fx + dx * cell, fy + dy * cell);
     const center = D(0, 0);
     let ring1 = 0, ring2 = 0;
@@ -232,10 +288,16 @@
     for (const [ux, uy] of [[1,0],[-1,0],[0,1],[0,-1]]) { ring1 += D(ux, uy); ring2 += D(ux * 2, uy * 2); }
     ring1 /= 4; ring2 /= 4;
     // 中央は明るいリングより十分暗く、外リングも明るいリングより十分暗いこと。
-    //  しきい 40（255 階調）＝おおよそ二値化マージンの目安。
-    if (!(center - ring1 > 40 && ring2 - ring1 > 40)) return null;
+    //  マージンは実効レンジの 35%（=二値化マージンの目安の相対版）。
+    const margin = range * 0.35;
+    if (!(center - ring1 > margin && ring2 - ring1 > margin)) return null;
 
-    return { x: fx, y: fy, score: bestScore };
+    // 診断・選別用の品質指標:
+    //  peakRatio    = 相関ピーク・コントラスト / 実効レンジ（構造の“鋭さ”）
+    //  ringMargin   = min(中央−明リング, 外リング−明リング) / range（同心性の強さ）
+    const peakRatio = peakSpan / range;
+    const ringMargin = Math.min(center - ring1, ring2 - ring1) / range;
+    return { x: fx, y: fy, score: bestScore, range, peakRatio, ringMargin };
   }
 
   // 制御点メッシュを張る。座標系は「正規化グリッド座標 u,v∈[0,1]」で統一する
@@ -264,12 +326,28 @@
     const iAlignFirst = 1, iAlignLast = us.length - 2;
     const jAlignFirst = 1, jAlignLast = vs.length - 2;
 
-    // --- パス1: 各格子点の予測値を敷き、内部節点はアライメント検出を試みる ---
-    //  検出できた節点は「予測からの乖離ベクトル (ddx,ddy)」を候補として持たせ、
-    //  採否はパス2の外れ値除去でまとめて決める（1 点の誤検出でメッシュが
-    //  破綻しないようにするため）。
+    // ==================================================================
+    //  §10-8 内部アライメント検出の粗→密反復（探索窓不足バグの本命修正）
+    // ------------------------------------------------------------------
+    //  旧実装は「大域ホモグラフィ予測の周囲を固定 ±1.6 セルで 1 回だけ探索し、
+    //  かつ乖離 1.5 セル以上は誤検出とみなして棄却」していた。しかし中央たわみ
+    //  では真の乖離が 3〜5 セルに達するため、真のアライメントが窓外・棄却帯に
+    //  出て 87% が原理的に見つからず、四隅は正確なのに内部メッシュが崩壊した。
+    //
+    //  新実装は QR/写真計測の定石＝「粗いアンカーから密へ伝播」する:
+    //   パスA（粗アンカー）: 探索窓を **期待される最大歪み分だけ広げて**
+    //     （±3.2 セル）、大域予測の周りから“確実に構造検証を通る”アライメントを
+    //     まず数点拾う。窓が広いぶん誤検出も混じり得るが、後段の空間平滑性
+    //     フィルタ（パス2）で除去する。
+    //   パスB（密伝播・反復）: まだ見つかっていない節点それぞれについて、
+    //     すでに見つかった近傍節点の「乖離ベクトル場」を距離重み付き補間して
+    //     予測位置を補正し、その改善予測の周りを **狭い窓（±1.2 セル）** で
+    //     探索する。近傍が確定するほど予測が正確になり、狭い窓でも高確率で
+    //     当たる。新規検出が無くなるまで数回反復する。
+    //  この「広い窓で種を蒔き、狭い窓で確実に増やす」構造で、たわみでも
+    //  内部検出率が 14%→ほぼ全点に跳ね上がる。
+    // ==================================================================
     const pts = [];
-    const cand = [];               // 採用候補の乖離量（外れ値判定用）
     for (let j = 0; j < vs.length; j++) {
       const rowPts = [];
       for (let i = 0; i < us.length; i++) {
@@ -277,65 +355,270 @@
         const onUedge = (i === 0 || i === us.length - 1);
         const onVedge = (j === 0 || j === vs.length - 1);
         if (onUedge && onVedge) {
-          // 4 隅はファインダから求めた corners を使う（TL,TR,BR,BL）。
           const isL = (i === 0), isT = (j === 0);
           const cidx = isT ? (isL ? 0 : 1) : (isL ? 3 : 2);
-          rowPts.push({ x: corners[cidx].x, y: corners[cidx].y, corner: true });
+          rowPts.push({ x: corners[cidx].x, y: corners[cidx].y, corner: true, i, j });
           continue;
         }
         const pred = predict(u, v);
-        const cell = { x: pred.x, y: pred.y, predicted: true };
-        rowPts.push(cell);
-        // 3 隅のアライメント（TL/TR/BL）は §3/qr-align の規則でファインダと
-        //  重なるため描画されていない。検出せず予測を使う。
-        const undrawnCorner =
-          (i === iAlignFirst && j === jAlignFirst) ||   // TL
-          (i === iAlignLast  && j === jAlignFirst) ||   // TR
-          (i === iAlignFirst && j === jAlignLast);      // BL
-        if (onUedge || onVedge || undrawnCorner) continue;
-
-        const ref = refineAlignment(img, pred, span, invert);
-        if (!ref) continue;
-        const ddx = ref.x - pred.x, ddy = ref.y - pred.y;
-        const dev = Math.hypot(ddx, ddy);
-        // 乖離の妥当帯域:
-        //   下限 0.35 セル … これ未満は歪み無し（クリーン）。予測に委ねて
-        //     ECC0 の境界セル反転を避ける（ON を OFF に劣化させない）。
-        //   上限 1.5 セル  … たわみ・レンズ歪みは節点間で緩やかに変化するため、
-        //     実位置が 1.5 セル以上跳ぶ“検出”はデータ領域の偶然の一致とみなす。
-        if (dev > cellPx * 0.35 && dev < cellPx * 1.5) {
-          cell._cand = { ddx, ddy, ref };
-          cand.push({ ddx, ddy });
-        }
+        rowPts.push({ x: pred.x, y: pred.y, predicted: true, i, j, u, v });
       }
       pts.push(rowPts);
     }
 
-    // --- パス2: 外れ値除去 --------------------------------------------
-    //  真の歪みは空間的になめらか＝採用候補の乖離ベクトルは互いに近い。
-    //  中央値ベクトルから大きく外れた候補（孤立した誤検出）は棄却し、
-    //  予測値のまま残す。これでデータ領域が偶然マーカーに似た 1 点で
-    //  メッシュが破綻するのを防ぐ（特に ECC0 での安全性）。
-    let refined = 0;
-    if (cand.length > 0) {
-      const med = (arr) => { const a = arr.slice().sort((p, q) => p - q); return a[a.length >> 1]; };
-      const mdx = med(cand.map(c => c.ddx));
-      const mdy = med(cand.map(c => c.ddy));
-      // 中央絶対偏差(MAD)ベースの許容半径。最低でも 0.5 セルは許す。
-      const mad = med(cand.map(c => Math.hypot(c.ddx - mdx, c.ddy - mdy)));
-      const tol = Math.max(cellPx * 0.5, mad * 3);
+    // この節点が「描画されている内部アライメント」か（検出対象か）を判定。
+    //  境界節点(u/v edge) と 3 隅の未描画アライメント(TL/TR/BL) は検出しない。
+    const isDetectable = (i, j) => {
+      const onUedge = (i === 0 || i === us.length - 1);
+      const onVedge = (j === 0 || j === vs.length - 1);
+      if (onUedge || onVedge) return false;
+      const undrawnCorner =
+        (i === iAlignFirst && j === jAlignFirst) ||   // TL
+        (i === iAlignLast  && j === jAlignFirst) ||   // TR
+        (i === iAlignFirst && j === jAlignLast);      // BL
+      return !undrawnCorner;
+    };
+
+    // 検出済み節点（found=true）の乖離ベクトルから、任意節点 (i,j) の予測補正を
+    //  距離重み付き（IDW）で推定する。found が無ければ大域予測をそのまま返す。
+    const localPredict = (i, j) => {
+      const base = predict(us[i], vs[j]);
+      let wsum = 0, sx = 0, sy = 0, cnt = 0;
       for (const row of pts) {
         for (const cell of row) {
-          if (!cell._cand) continue;
-          const { ddx, ddy, ref } = cell._cand;
-          delete cell._cand;
-          if (Math.hypot(ddx - mdx, ddy - mdy) <= tol) {
-            cell.x = ref.x; cell.y = ref.y; cell.predicted = false; refined++;
-          }
+          if (!cell.found) continue;
+          const p0 = predict(us[cell.i], vs[cell.j]);
+          const ddx = cell.x - p0.x, ddy = cell.y - p0.y;
+          const di = cell.i - i, dj = cell.j - j;
+          const d2 = di * di + dj * dj;
+          if (d2 === 0) continue;
+          const wgt = 1 / (d2 * d2);   // 近傍を強く優先（IDW p=4 相当）
+          sx += ddx * wgt; sy += ddy * wgt; wsum += wgt; cnt++;
         }
       }
+      if (cnt === 0 || wsum === 0) return base;
+      return { x: base.x + sx / wsum, y: base.y + sy / wsum };
+    };
+
+    // 1 節点の検出試行。winCells の窓で探索し、構造検証を通り、かつ予測
+    //  （localPredict/大域予測）からの残差が maxDevCells 以内なら採用する。
+    //  usePred=true は「近傍 found から補正した局所予測」を基準にする（伝播用）。
+    const tryDetect = (cell, i, j, winCells, maxDevCells, usePred) => {
+      const pred = usePred ? localPredict(i, j) : predict(us[i], vs[j]);
+      const ref = refineAlignment(img, pred, span, invert, { winCells });
+      if (!ref) return false;
+      const dev = Math.hypot(ref.x - pred.x, ref.y - pred.y);
+      if (dev > cellPx * maxDevCells) return false;   // 予測から遠すぎ＝誤検出
+      cell.x = ref.x; cell.y = ref.y; cell.predicted = false; cell.found = true;
+      cell.ref = ref;
+      return true;
+    };
+    const countFound = () => {
+      let n = 0; for (const row of pts) for (const c of row) if (c.found) n++; return n;
+    };
+
+    // 期待される最大歪み（セル単位）は密度に比例する（実測: 概ね cols/48）。
+    //  探索窓・許容残差をこの density-adaptive なスケールで決めると、低密度版
+    //  （ver1〜4）では旧来どおり狭く保って誤検出を避けつつ、高密度版（ver8〜14）
+    //  では窓を必要なだけ広げて真のアライメントを取りこぼさない。
+    const distScale = Math.max(cols, rows) / 48;         // ≒ 予想最大乖離(セル)
+    const coarseWin = Math.min(3.4, Math.max(1.8, distScale * 0.9)); // 粗窓
+    const coarseDev = Math.min(3.6, Math.max(1.7, distScale + 0.4)); // 粗許容残差
+
+    // --- パスA: 粗シード（大域予測基準）--------------------------------
+    //  まず大域予測の周りを density-adaptive な窓で探索し、種を蒔く。誤検出は
+    //  後段の局所平滑性フィルタ（パス2）で落とす。窓が広い高密度版でも、種を
+    //  蒔いたあとはパスBの局所予測で残差が締まる。
+    for (let j = 0; j < vs.length; j++)
+      for (let i = 0; i < us.length; i++)
+        if (isDetectable(i, j)) tryDetect(pts[j][i], i, j, coarseWin, coarseDev, false);
+
+    // --- パスB: 密伝播（狭い窓・近傍補正予測基準・反復）----------------
+    //  近傍 found から補正した予測（localPredict）の周りを狭い窓 ±1.3 セルで
+    //  探索し、残差 0.9 セル以内を採用。予測が近傍で補正されているので狭い窓
+    //  でも当たり、かつ厳しい残差で誤検出を締める。新規が無くなるまで反復。
+    for (let iter = 0; iter < 8; iter++) {
+      let added = 0;
+      for (let j = 0; j < vs.length; j++)
+        for (let i = 0; i < us.length; i++) {
+          const cell = pts[j][i];
+          if (cell.found || !isDetectable(i, j)) continue;
+          if (tryDetect(cell, i, j, 1.3, 0.9, true)) added++;
+        }
+      if (added === 0) break;
     }
-    return { us, vs, pts, cols, rows, span, refined,
+
+    // 各 found 節点の「大域予測からの乖離ベクトル」を記録（外れ値判定に使う）。
+    for (const row of pts)
+      for (const cell of row)
+        if (cell.found) {
+          const p0 = predict(us[cell.i], vs[cell.j]);
+          cell.ddx = cell.x - p0.x; cell.ddy = cell.y - p0.y;
+        }
+
+    // --- パス2: 局所平滑性による外れ値除去 ----------------------------
+    //  【§10-8 の重要修正】旧実装は「全 found の乖離が単一の中央値ベクトル
+    //  近傍にある」ことを仮定した大域中央値フィルタだった。これはクランプで
+    //  乖離を <1.5 セルに抑えていた時代の前提であり、実際のバレル歪みでは
+    //  乖離が位置ごとに 0〜5 セルへ連続変化する（中心小・周辺大・向きも様々）
+    //  ため、正しい検出まで“中央値から遠い”として大量に棄却してしまう。
+    //
+    //  歪み場が保証するのは「大域的に一定」ではなく「**局所的に滑らか**」で
+    //  ある。そこで各 found を、その **k 近傍 found の乖離の中央値** と比べ、
+    //  近傍と食い違う（＝孤立した誤検出）ものだけを棄却する。近傍が乏しい
+    //  （<3）節点は大域中央値でバックストップ判定する。これでバルジの連続的
+    //  歪みは全面採用しつつ、データ領域の偶然一致は落とせる。
+    //
+    //  【実機フィードバック §10-1: バルジ k=0.018 の ON 単体劣化バグ】
+    //  ver3/ecc3 の中央たわみ掃引（test/e2e §10-1）で、k=0.016(正常)→
+    //  k=0.018(ON だけ flips 135 で失敗)→k=0.02(正常化) という**非単調な特異点**
+    //  が判明した。原因を全 found 節点の「近傍中央値からの残差 / cellPx」で切り分け
+    //  た結果、**ただ 1 つの内部アライメント節点（右上, cell≈(63,6)）の検出中心が
+    //  ~0.8 セルずれる誤検出**で、その 1 点が区分 bilinear メッシュを引きつれて
+    //  周囲 25×14 セルを反転させていた（k を上げると誤検出の乖離が偶然ピークに
+    //  乗る非単調挙動）。
+    //  実測（test/_k_toldist*.js）: 正当なバルジ warp 節点の残差は最悪でも
+    //   ≤0.54 セル（ver8〜14/k≤0.024）に収まる一方、この誤検出だけが 0.78〜0.87
+    //   セルへ突出していた。旧しきい tolNbr=cellPx*0.9 はこの外れ値を取りこぼして
+    //   いた。しきいを cellPx*0.6 へ締めると、正当節点（≤0.54）は全て残しつつ
+    //   誤検出だけを弾ける（0.54 と 0.78 の間に十分なマージンがある）。
+    //  さらに棄却時の後始末を改善: 従来は「大域予測へ戻す（found 解除）」だった
+    //   が、それだと周囲の warp を捨てて縁の外挿にも寄与しなくなる。代わりに
+    //   **近傍中央値の乖離ベクトル (mdx,mdy) を予測へ足した局所平滑位置**へ
+    //   スナップする（found のまま＝局所 warp を保持）。これで誤検出 1 点だけを
+    //   周囲と滑らかに一致させ、区分メッシュの折れを解消する。
+    let refined = 0;
+    const foundCells = [];
+    for (const row of pts) for (const cell of row) if (cell.found) foundCells.push(cell);
+    if (foundCells.length > 0) {
+      const med = (arr) => { const a = arr.slice().sort((p, q) => p - q); return a.length ? a[a.length >> 1] : 0; };
+      const gdx = med(foundCells.map(c => c.ddx));
+      const gdy = med(foundCells.map(c => c.ddy));
+      const K = 5;                          // 近傍数
+      const tolNbr = Math.max(cellPx * 0.6, 1);   // 近傍中央値との許容差（§10-1 で 0.9→0.6）
+      const tolGlob = Math.max(cellPx * 2.5, 1);  // 近傍が乏しい時の大域許容差
+      for (const cell of foundCells) {
+        // 近傍 K 個（自分以外の found）を格子距離で選ぶ。
+        const nbrs = foundCells
+          .filter(o => o !== cell)
+          .map(o => ({ o, d2: (o.i - cell.i) ** 2 + (o.j - cell.j) ** 2 }))
+          .sort((a, b) => a.d2 - b.d2)
+          .slice(0, K)
+          .map(e => e.o);
+        let mdx, mdy, tol, haveNbr;
+        if (nbrs.length >= 3) {
+          mdx = med(nbrs.map(o => o.ddx)); mdy = med(nbrs.map(o => o.ddy)); tol = tolNbr; haveNbr = true;
+        } else {
+          mdx = gdx; mdy = gdy; tol = tolGlob; haveNbr = false;
+        }
+        if (Math.hypot(cell.ddx - mdx, cell.ddy - mdy) <= tol) {
+          cell.predicted = false; refined++;
+        } else if (haveNbr) {
+          // 外れ値だが近傍が十分ある: 近傍中央値の乖離へスナップ（局所 warp を保持）。
+          //  大域予測へ丸めるより滑らかで、縁の外挿にも寄与し続ける。
+          const p0 = predict(us[cell.i], vs[cell.j]);
+          cell.x = p0.x + mdx; cell.y = p0.y + mdy;
+          cell.ddx = mdx; cell.ddy = mdy;
+          cell.predicted = false; refined++;
+        } else {
+          // 外れ値かつ近傍が乏しい: 信頼できる補正が作れないので大域予測へ戻す。
+          const p0 = predict(us[cell.i], vs[cell.j]);
+          cell.x = p0.x; cell.y = p0.y; cell.predicted = true; cell.found = false;
+        }
+        delete cell._cand;
+      }
+    }
+
+    // --- パス3: 境界節点への歪み場の外挿（内部アライメント検出の“端まで延長”）---
+    //  【実機フィードバック §10-7】バグの核心:
+    //  内部（アライメント節点がある領域）は refined 節点で正しく補正されるが、
+    //  最外アライメント列（セル 6 と n-7）より外側の**境界帯**（データ箱の縁〜
+    //  最外アライメント）は、これまで「四隅 corners への大域予測」に丸めていた。
+    //  中央たわみ（バレル歪み）ではこの境界帯こそ大域ホモグラフィが最も外れる
+    //  ため、高密度版（ver14）では縁のセルが数%も反転し、内部は完璧なのに RS を
+    //  超過していた（四隅は正確なのに“内部アライメント側で崩れる”実機症状の
+    //  正体）。
+    //
+    //  対策: 境界節点 (u=0/1 または v=0/1) の位置を corners/大域予測へ丸めず、
+    //  同じ行/列で内側にある 2 つの refined 節点の「予測からの乖離ベクトル」を
+    //  線形外挿して与える。これで内部で観測した歪み場が縁まで滑らかに延長され、
+    //  境界帯のサンプリングが実位置に追従する。外挿は refined 節点が 2 つ以上
+    //  ある行/列でのみ行い（1 点以下なら大域予測のまま＝クリーン時の安全側）、
+    //  外挿量は 2 セルにクランプして暴れを防ぐ。
+    if (refined >= 3) {
+      // node.u / node.v は正規化座標。乖離＝実位置 − 大域予測。
+      const dev = (node) => {
+        const p = predict(node.u, node.v);
+        return { ddx: node.cell.x - p.x, ddy: node.cell.y - p.y };
+      };
+      // 1 本の節点列（行 or 列）について、内側 refined 2 点から両端を線形外挿。
+      const extrap1D = (nodes) => {
+        // t=その軸に沿う正規化座標（昇順）。ref=検出済み内部節点。
+        const ref = nodes.filter(n => n.cell && n.cell.predicted === false && !n.cell.corner);
+        if (ref.length < 2) return;
+        const first = ref[0], second = ref[1];
+        const last = ref[ref.length - 1], prev = ref[ref.length - 2];
+        const d0 = dev(first), d1 = dev(second), dL = dev(last), dP = dev(prev);
+        for (const n of nodes) {
+          if (!n.cell || n.cell.corner) continue;
+          if (n.cell.predicted === false) continue;         // 検出済みは触らない
+          const isLowEnd  = n.t <= first.t;                 // 低い側の端／外側
+          const isHighEnd = n.t >= last.t;                  // 高い側の端／外側
+          if (!isLowEnd && !isHighEnd) continue;            // 内側の未検出は大域予測のまま
+          let ex, ey;
+          if (isLowEnd) {
+            const denom = (second.t - first.t) || 1;
+            const s = (n.t - first.t) / denom;              // s<=0（外挿）
+            ex = d0.ddx + (d1.ddx - d0.ddx) * s;
+            ey = d0.ddy + (d1.ddy - d0.ddy) * s;
+          } else {
+            const denom = (last.t - prev.t) || 1;
+            const s = (n.t - last.t) / denom;               // s>=0（外挿）
+            ex = dL.ddx + (dL.ddx - dP.ddx) * s;
+            ey = dL.ddy + (dL.ddy - dP.ddy) * s;
+          }
+          // 外挿量を ±2 セルにクランプ（暴れ防止）。
+          const mag = Math.hypot(ex, ey), lim = cellPx * 2;
+          if (mag > lim) { ex *= lim / mag; ey *= lim / mag; }
+          const p = predict(n.u, n.v);
+          n.cell.x = p.x + ex; n.cell.y = p.y + ey; n.cell.extrapolated = true;
+        }
+      };
+
+      // 各行 j（v 固定）: i=0..last の節点列を u 昇順で外挿。
+      for (let j = 1; j < vs.length - 1; j++) {
+        const nodes = [];
+        for (let i = 0; i < us.length; i++) {
+          nodes.push({ t: us[i], u: us[i], v: vs[j], cell: pts[j][i] });
+        }
+        extrap1D(nodes);
+      }
+      // 各列 i（u 固定）: j=0..last の節点列を v 昇順で外挿。
+      for (let i = 1; i < us.length - 1; i++) {
+        const nodes = [];
+        for (let j = 0; j < vs.length; j++) {
+          nodes.push({ t: vs[j], u: us[i], v: vs[j], cell: pts[j][i] });
+        }
+        extrap1D(nodes);
+      }
+    }
+
+    // メッシュが大域ホモグラフィから離れている度合い（最大／中央値, セル単位）。
+    //  §10-1 の安全ゲート用: 乖離が小さいなら大域ホモグラフィの方が滑らかで安全
+    //  なので、sampleModules 側はメッシュを採用せず大域予測へフォールバックする。
+    let maxDevCells = 0;
+    const devs = [];
+    for (const row of pts) for (const cell of row) {
+      if (cell.predicted === false && !cell.corner) {
+        const p0 = predict(us[cell.i], vs[cell.j]);
+        const d = Math.hypot(cell.x - p0.x, cell.y - p0.y) / cellPx;
+        devs.push(d); if (d > maxDevCells) maxDevCells = d;
+      }
+    }
+    devs.sort((a, b) => a - b);
+    const medDevCells = devs.length ? devs[devs.length >> 1] : 0;
+
+    return { us, vs, pts, cols, rows, span, refined, maxDevCells, medDevCells,
              total: (us.length - 2) * (vs.length - 2) };
   }
 
@@ -394,14 +677,28 @@
     let mesh = null;
     if (useAlignment) {
       const m = buildControlMesh(img, corners, cols, rows, invert);
-      // しきい割合 0.15 は実測に基づく: OFF が成功する軽微たわみ(k<=0.010)は
-      //  refined<=2/35(<=6%)、OFF が失敗し ON で救うべき帯域(k>=0.014)は
-      //  refined>=12/35(>=34%)。両者の谷（6%〜34%）に 15% を置くことで、
-      //  クリーン誤検出を確実に弾きつつ本物のたわみは取りこぼさない。
-      //  併せて最低 3 点は要求し、1〜2 点のみのメッシュ化を防ぐ。
+      // §10-1 の安全ゲート（ON は OFF に劣化させない）。3 条件すべてを要求する:
+      //  (1) 検出点が十分ある（refined>=3, かつ内部節点の 15% 以上）… 疎すぎる
+      //      誤検出でメッシュを張らない（従来からの条件）。
+      //  (2) 【§10-8 追加】メッシュが大域ホモグラフィから **有意に離れている**
+      //      こと。旧実装は「検出率が高ければメッシュ採用」だったが、内部検出を
+      //      強化した結果、軽微たわみでも検出率が高くなり、大域ホモグラフィが
+      //      既に完璧な低密度版（ver3 等, 実測 flips=0）でも 86% 検出→メッシュ
+      //      採用→区分 bilinear の微小折れで **74 セルも反転**する劣化を招いた。
+      //      歪みが小さい（メッシュ中央値乖離 < 0.6 セル かつ 最大 < 1.2 セル）
+      //      なら大域ホモグラフィの方が滑らかで安全なのでメッシュを採用しない。
+      //      真のたわみは節点を大きく（>1.2 セル）動かすのでここで判別できる。
       const enoughFrac  = m.total > 0 && (m.refined / m.total) >= 0.15;
       const enoughCount = m.refined >= 3;
-      if (enoughFrac && enoughCount) mesh = m;
+      // significantWarp のしきいは「同じ残差乖離でも高密度ほど多くのセルを
+      //  反転させる」実測に基づく: 大域ホモグラフィで復元できる低密度版
+      //  （ver1〜4, globalFlips=0）は残差中央値 <=0.31 セルに収まる一方、
+      //  大域では大量反転する高密度版（ver8〜14, globalFlips=数千〜）は
+      //  >=0.44 セル。境界の 0.40 で「大域で足りる/メッシュが要る」を分ける。
+      //  なお decodeAnyVersion 側の「アライメント ON/OFF 二段試行」が最終
+      //  安全網なので、この静的ゲートを外しても正しさは保たれる（速度最適化）。
+      const significantWarp = (m.maxDevCells >= 1.2) || (m.medDevCells >= 0.40);
+      if (enoughFrac && enoughCount && significantWarp) mesh = m;
     }
     const mapCell = mesh
       ? (c, r) => meshMap(mesh, c, r)
@@ -448,7 +745,12 @@
     }
 
     // --- (A) 大域 Otsu しきい（セル平均のヒストグラムから）--------------
-    const globalThr = otsuThresholdF(cellAvg);
+    //  clusterMeans=[黒山平均, 白山平均] も受け取り、実効ダイナミックレンジ
+    //  gRange=白山−黒山 を得る（パス2の“レンジ相対マージン”に使う）。
+    const _otsu = otsuThresholdF(cellAvg, true);
+    const globalThr = _otsu.mid;
+    const gBlack = _otsu.mB, gWhite = _otsu.mF;
+    const gRange = Math.max(1, gWhite - gBlack);
 
     // --- (B) 適応的局所しきい: 各セル周囲 window 内のセル平均の局所平均 ---
     //  積分画像（summed-area table）で任意窓の局所平均を O(1) で引く。
@@ -477,7 +779,37 @@
     //  （＝情報が乏しい一様領域）ときは局所しきいが不安定なので、大域 Otsu へ
     //  寄せて誤反転を防ぐ。C は輝度スケールの数%相当（全面ドットゲインでは
     //  黒白コントラストが縮むため過大にしない）。
+    //
+    //  【実機フィードバック §10-9: 二値化先行→膨張ドットゲインの黒潰れバグ】
+    //  実機の「先に二値化してから 4 近傍膨張」型ドットゲイン（自作 degrade.js
+    //  方式）を render-helper.dotGainBinary で忠実再現して掃引したところ、
+    //  高密度版（ver14, セル≒8.6px）で膨張 3 回（セル比 0.35）を掛けると
+    //  **黒セルの 27.9% が“白”へ誤反転**して MAGIC 不一致で全滅していた
+    //  （ver14/ecc0/growPx3: flips 25097/90000）。
+    //  原因を実測で切り分けた結果:
+    //   ・膨張後は盤面の約半分が黒に太り、白セルの平均が黒側へ大きく寄る
+    //     （white-truth の cellAvg が [36.5, 110] へ潰れ、black-truth=30 と
+    //      わずか 6.5 しか離れない region が生じる）。
+    //   ・その region では 局所平均 lm≈35.9、globalThr≈37 となり、
+    //     しきい thr = lm − C(=6) ≈ 29.9〜30.0 が **黒の実値 30.0 に一致**する。
+    //   ・判定が厳密不等号 `avg < thr` だったため `30.0 < 30.0` が偽になり、
+    //     真っ黒のセルが“白”と読まれていた（＝しきいが黒クラスタ上に着地して
+    //     いた off-by-epsilon）。これがパス2の局所平滑性フィルタでもパス3の
+    //     境界外挿でもない、**二値化しきいそのものの実バグ**である。
+    //  対策: しきいを黒クラスタから確実に引き離すため、実効レンジ gRange の
+    //   一定割合（MARGIN_FRAC）だけ「暗側（1=黒 と読む側）へ」広げた
+    //   `avg < thr + margin` で判定する。margin は絶対値 C ではなくレンジ
+    //   相対なので、ドットゲインでコントラストが 255→80 に縮んでも比例縮小して
+    //   追従する。実測掃引（test/e2e-selftest §10-9）で MARGIN_FRAC=0.10 が
+    //   ver14/ecc0/growPx3 の flips を 25097→24（＝復元成功）に激減させつつ、
+    //   ecc3/growPx3（元々 flips=0）・低密度版・クリーンを退行させない最適値。
+    //  なぜ黒側へ寄せてよいか: 二値化先行→膨張は物理的に「黒だけが太る」非対称
+    //   劣化なので、境界の曖昧セルは白より黒である事前確率が高い。margin で
+    //   暗側へ寄せるのはこの非対称性に沿った最尤側の補正であり、白セルが黒へ
+    //   潰れる g≥4（情報消失域）を除けば白→黒の誤反転は増えない（実測）。
     const C = 6;
+    const MARGIN_FRAC = 0.10;
+    const margin = gRange * MARGIN_FRAC;
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const avg = cellAvg[r * cols + c];
@@ -490,7 +822,8 @@
         const dev = Math.abs(lm - globalThr);
         const alpha = Math.min(1, dev / 64);          // 0(近い)→1(遠い)
         thr = thr * (1 - alpha) + globalThr * alpha;
-        modules[r * cols + c] = avg < thr ? 1 : 0;
+        // §10-9: しきいを黒クラスタから引き離すレンジ相対マージン（暗側へ拡張）。
+        modules[r * cols + c] = avg < thr + margin ? 1 : 0;
       }
     }
     modules.__meshRefined = mesh ? mesh.refined : 0;
@@ -501,7 +834,9 @@
   // セル平均（Float32Array, 0..255）に対する大津法。CF.otsuThreshold は
   //  整数 gray 前提のため、ここでは連続値を 256bin に量子化して求める。
   //  返り値は「黒山と白山の中点」（CF.otsuThreshold と同じ思想）。
-  function otsuThresholdF(vals) {
+  //  withClusters=true のときは {mid, mB, mF}（黒山平均・白山平均）を返す。
+  //  §10-9 のレンジ相対マージンが実効ダイナミックレンジ mF−mB を要るため。
+  function otsuThresholdF(vals, withClusters) {
     const hist = new Array(256).fill(0);
     for (let i = 0; i < vals.length; i++) {
       let v = vals[i] | 0; if (v < 0) v = 0; else if (v > 255) v = 255;
@@ -524,6 +859,12 @@
     let mid = (mBstar + mFstar) / 2;
     if (!isFinite(mid)) mid = 128;
     if (mid < 5 || mid > 250) mid = 128;
+    if (withClusters) {
+      let mB = isFinite(mBstar) ? mBstar : 0;
+      let mF = isFinite(mFstar) ? mFstar : 255;
+      if (!(mF > mB)) { mB = 0; mF = 255; }   // 退化時は全域レンジで保険
+      return { mid, mB, mF };
+    }
     return mid;
   }
 
@@ -540,22 +881,46 @@
     opt = opt || {};
     // invert 両方を試す（黒地/白地どちらのスキャンでも動くように）。
     const inverts = opt.invert != null ? [!!opt.invert] : [false, true];
+    // 試し読みする版の集合。既定は全版（＝プロダクションの自動判別）。
+    //  opt.versions を渡すと候補版を絞れる（テストや、版が既知の場面で
+    //  全 14 版 × 全面サンプリングの重い試し読みを避けるための任意最適化。
+    //  プロダクションの decoder.html は既定のまま＝全版自動判別を維持する）。
+    let versions = CF.VERSIONS;
+    if (opt.versions != null) {
+      const want = Array.isArray(opt.versions) ? opt.versions : [opt.versions];
+      const set = new Set(want);
+      versions = CF.VERSIONS.filter(v => set.has(v));
+      if (versions.length === 0) versions = CF.VERSIONS; // 不正指定は全版へ退避
+    }
+    // アライメント制御点メッシュを使うか。既定 true。
+    //  【§10-1/§10-8 の最終安全網】opt.useAlignment を明示しない既定運用では、
+    //  各版で「メッシュ ON」→（完全復号できなければ）「メッシュ OFF＝大域
+    //  ホモグラフィ」の順に **両方** 試し、RS 完全復号できた方を採用する。
+    //  これにより「ON が OFF に劣化しない」（§10-1）を、静的ゲートの当て推量に
+    //  頼らず **決定的に保証** する（メッシュが偶然悪化する版でも大域で救済）。
+    //  opt.useAlignment を明示した場合はその 1 モードのみ（比較検証用）。
+    const alignModes = opt.useAlignment != null
+      ? [opt.useAlignment]
+      : [true, false];
+
     let last = { ok: false, reason: 'not-detected' };
     for (const invert of inverts) {
       const corners = opt.corners || detectCorners(img, { invert });
       if (!corners) { last = { ok: false, reason: 'no-corners' }; continue; }
-      for (const version of CF.VERSIONS) {
+      for (const version of versions) {
         const prof = CF.getProfile(version);
-        const modules = sampleModules(img, corners, prof.COLS, prof.ROWS,
-          { invert, useAlignment: opt.useAlignment });
-        const r = CF.decodePageModules(modules, prof.COLS, prof.ROWS);
-        if (r.meta && r.meta.magicOk) {
-          // MAGIC 一致かつ自己申告 version がこの版と一致するものを最優先採用。
-          if (r.meta.version === version && r.ok) {
-            return Object.assign({ version, corners, invert }, r);
+        for (const useAlignment of alignModes) {
+          const modules = sampleModules(img, corners, prof.COLS, prof.ROWS,
+            { invert, useAlignment });
+          const r = CF.decodePageModules(modules, prof.COLS, prof.ROWS);
+          if (r.meta && r.meta.magicOk) {
+            // MAGIC 一致かつ自己申告 version がこの版と一致し RS 完全復号 → 即採用。
+            if (r.meta.version === version && r.ok) {
+              return Object.assign({ version, corners, invert, useAlignment }, r);
+            }
+            // MAGIC は合うが RS 未完（ヘッダだけ拾えた）→ 記録して継続。
+            last = Object.assign({ version, corners, invert, useAlignment }, r);
           }
-          // MAGIC は合うが RS 未完（ヘッダだけ拾えた）→ 記録して継続。
-          last = Object.assign({ version, corners, invert }, r);
         }
       }
     }
