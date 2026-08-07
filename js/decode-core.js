@@ -918,8 +918,21 @@
             if (r.meta.version === version && r.ok) {
               return Object.assign({ version, corners, invert, useAlignment }, r);
             }
-            // MAGIC は合うが RS 未完（ヘッダだけ拾えた）→ 記録して継続。
-            last = Object.assign({ version, corners, invert, useAlignment }, r);
+            // MAGIC は合うが RS 未完（ヘッダ RS は成功しヘッダ内容まで確定して
+            //  いるのに、本文側の RS 訂正だけが劣化超過で失敗した状態）。
+            //  ここで明示的に reason='payload-rs-fail' を立てておかないと、
+            //  decodePageModules は成功系の戻り値に reason を積まないため、
+            //  「reason キーが一度もセットされないまま」最後まで残ってしまい、
+            //  呼び出し側（decoder.html）の `r.reason || ('ver'+version+' 未確定')`
+            //  フォールバックが、バージョン不明のときと同じ「未確定」表示を
+            //  出してしまう（実態は「ver 確定・本文復元失敗」なのに区別不能）。
+            //  §fix: ヘッダ確定（meta.magicOk / meta.ok）と全体成功（r.ok）を
+            //  呼び出し側が区別できるよう、原因コードを明示的に付与する。
+            last = Object.assign(
+              { version, corners, invert, useAlignment },
+              r,
+              { reason: 'payload-rs-fail' }   // r より後に置き、確実に原因コードを残す
+            );
           }
         }
       }
