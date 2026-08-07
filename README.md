@@ -41,8 +41,17 @@
 ```bash
 node test/design-selftest.js   # §2〜§4: 箱定数・0.7mm 下限・容量表
 node test/core-selftest.js     # §5〜§7: RS 訂正・インターリーブ・マスク・ヘッダ
+node test/decode-message-selftest.js  # 失敗文言: ヘッダ確定/本文RS失敗の区別
 node test/e2e-selftest.js      # §10: 印刷→スキャン→復元の 1 サイクル e2e
 ```
+
+- `decode-message-selftest.js`: decoder.html の失敗メッセージが実態と一致する
+  ことの回帰。`decodeAnyVersion` が「ヘッダ RS 完全成功・本文 RS 失敗」の状態で
+  `reason='payload-rs-fail'` / `meta.ok=true` を返し、文言が「ver 不明・検出失敗」
+  と「verX 確定・本文の誤り訂正に失敗」を明確に区別することを固定する。
+- `payload-rsfail-diag.js`（調査ツール・テストではない）: 「verX 確定なのに本文
+  RS 失敗」をブロック単位で計測し原因を数値で切り分ける。結論は
+  [`docs/INVESTIGATE-payload-rsfail.md`](docs/INVESTIGATE-payload-rsfail.md)。
 
 - `design-selftest.js`: §2〜§4 の制約（箱定数・0.7mm 下限・アライメント両端保証・
   blockPlan の端数不捨・「A4 1枚 10KB」到達）を検証し容量表を出力する。
