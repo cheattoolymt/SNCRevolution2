@@ -123,6 +123,40 @@ function imageToData(img) {
   return { data: id.data, width: cv.width, height: cv.height };
 }
 
+// decodeAnyVersion() の失敗結果を、利用者が原因を誤認しない文言へ変換する。
+//  最重要の区別は「バージョンが確定しているか否か」。ヘッダ RS が完全成功して
+//  meta.magicOk / meta.ok まで確定していれば、バージョン・ECC・ページ情報は
+//  正しく読めており、失敗しているのは本文（payload）側の RS 訂正だけ。この
+//  状態を「ver 不明・未確定」と同じ文言で出すと「ECC の問題ではなさそう」と
+//  いった誤解を生むため、両者を明確に切り分ける。
+function describeFailure(r) {
+  if (!r) return '検出に失敗しました（画像を解析できません）';
+  const meta = r.meta;
+  const headerConfirmed = !!(meta && (meta.magicOk || meta.ok));
+
+  // 四隅マーカーを検出できなかった（そもそも版試し読みに入れていない）。
+  if (r.reason === 'no-corners') {
+    return '四隅マーカーを検出できません（傾き・見切れ・低コントラストの可能性）';
+  }
+
+  if (headerConfirmed) {
+    // ヘッダ RS は成功 → バージョン等は確定済み。本文 RS だけが失敗。
+    const ver = (meta && meta.version != null) ? meta.version
+      : (r.version != null ? r.version : '?');
+    if (!r.ok) {
+      return `ver${ver} 確定・本文の誤り訂正に失敗（劣化が強すぎる可能性：`
+        + `再スキャン／ECC 高で再作成をご検討ください）`;
+    }
+    return `ver${ver} 確定`;   // 通常ここには来ない（ok なら成功側で処理）
+  }
+
+  // ここまで来たらヘッダ MAGIC すら一致していない＝バージョン不明・検出失敗。
+  if (r.reason && r.reason !== 'payload-rs-fail') {
+    return `検出に失敗しました（${r.reason}）`;
+  }
+  return 'ver 不明・検出失敗（版ヘッダを認識できません）';
+}
+
 document.getElementById('go').addEventListener('click', async () => {
   info.className = 'info';
   info.textContent = '解析中…（版ごとに試し読みしています）';
@@ -136,7 +170,7 @@ document.getElementById('go').addEventListener('click', async () => {
   const okPages = results.filter(r => r && r.ok);
   if (okPages.length === 0) {
     info.className = 'info err';
-    const why = results.map((r, i) => `page${i + 1}: ${r ? (r.reason || ('ver' + r.version + ' 未確定')) : '失敗'}`).join('\n');
+    const why = results.map((r, i) => `page${i + 1}: ${describeFailure(r)}`).join('\n');
     info.textContent = '復元に失敗しました。スキャン品質（300dpi・二値・正面）をご確認ください。\n' + why;
     return;
   }

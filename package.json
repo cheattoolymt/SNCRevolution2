@@ -4,10 +4,11 @@
   "private": true,
   "description": "SuperNaidesuCardRevolution II (SNCR2) — 任意バイナリを紙に印刷し印刷→スキャンで復元する静的 HTML/JS ツール。出荷物は依存ゼロ（js/vendor/pako.min.js のみ同梱）。",
   "scripts": {
-    "test": "node test/design-selftest.js && node test/core-selftest.js && node test/align-selftest.js && node test/e2e-selftest.js",
+    "test": "node test/design-selftest.js && node test/core-selftest.js && node test/align-selftest.js && node test/decode-message-selftest.js && node test/e2e-selftest.js",
     "test:design": "node test/design-selftest.js",
     "test:core": "node test/core-selftest.js",
     "test:align": "node test/align-selftest.js",
+    "test:message": "node test/decode-message-selftest.js",
     "test:e2e": "node test/e2e-selftest.js"
   },
   "devDependencies": {
