@@ -56,7 +56,9 @@ if (!window.__noPdfJs && window.pdfjsLib) {
   <h1>🔍 SNCR2 — カード読み取り</h1>
   <div class="sub">
     印刷済みカードのスキャン画像から元ファイルを復元します。<br>
-    <b>推奨: スキャナ（300dpi・正面・等倍・平面固定）</b>。カメラ撮影は動作しますが非推奨です
+    <b>推奨: スキャナ（正面・等倍・平面固定）</b>。<br>
+    解像度はカードの密度に合わせてください：<b>ver1〜14 は 300dpi 以上、
+    ver15〜20（拡張密度）は 600dpi 以上</b>。カメラ撮影は動作しますが非推奨です
     （傾き・光量ムラ・手ブレで 0.7mm 級セルは失敗しやすい）。<br>
     複数ページは全ページの画像をまとめて選ぶと自動結合します。
     <a class="homelink" href="creator.html">→ 作成(Creator)へ</a>
@@ -67,7 +69,7 @@ if (!window.__noPdfJs && window.pdfjsLib) {
     <input type="file" id="file" accept="image/*,application/pdf" multiple>
     <div class="thumbs" id="thumbs"></div>
     <div class="warn">スキャンは<b>白黒（二値）</b>を想定しています。カラー/グレースケールでも大津法で二値化しますが、
-    可能な限りモノクロ 300dpi で取り込んでください。</div>
+    可能な限りモノクロで取り込んでください（拡張密度のカードは 600dpi 必須）。</div>
   </div>
 
   <div class="panel">
@@ -141,24 +143,46 @@ async function handleFiles(fileList) {
   document.getElementById('go').disabled = images.length === 0;
 }
 
-// PDF の各ページを 300dpi 相当でレンダリングし、imageToData() と同じ
-// {data, width, height} 形式で返す。creator.html 側の出力(CF.PAGE_W/PAGE_H,
-// 300dpi 前提)とスケールを合わせるため scale = 300/72 を使う。
+// PDF の各ページを高解像度でレンダリングし、imageToData() と同じ
+// {data, width, height} 形式で返す。
+//
+// 【拡張ティア対応の要点】以前は 300dpi 相当（scale = 300/72）で固定していたが、
+//  拡張版（ver15〜20）はセルが 0.7mm を割り、300dpi では 1 セル 6〜8px しか
+//  無いため、300dpi でラスタライズすると **セルが画素に埋もれて復号不能** に
+//  なる（creator は 600dpi で PNG を埋め込んでいるのに、読み側で 300dpi へ
+//  落として情報を捨てていた）。そこで既定を 600dpi 相当に上げる。
+//  ・標準版（ver1〜14）… 過剰解像度になるだけで復号は問題なく通る
+//    （decode-core は四隅から正規化するので絶対 px には依存しない）。
+//  ・拡張版（ver15〜20）… これで初めて正しく読める。
+//  A4 600dpi は 4960×7016px（RGBA で約 139MB）まで行くため、巨大 PDF で
+//  メモリが確保できない環境では 300dpi へ自動フォールバックする。
+const PDF_RENDER_DPI = 600;
 async function pdfToImageDatas(file) {
   const buf = await file.arrayBuffer();
   const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
-  const scale = 300 / 72; // PDF既定72dpi -> 300dpi相当
+  let scale = PDF_RENDER_DPI / 72; // PDF既定72dpi -> 600dpi相当
   const out = [];
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
-    const viewport = page.getViewport({ scale });
-    const cv = document.createElement('canvas');
-    cv.width = Math.round(viewport.width);
-    cv.height = Math.round(viewport.height);
-    const ctx = cv.getContext('2d');
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    const id = ctx.getImageData(0, 0, cv.width, cv.height);
-    out.push({ data: id.data, width: cv.width, height: cv.height });
+    // 高解像度で確保できない場合は段階的に落とす（メモリ枯渇でも読めるように）。
+    let id = null, w = 0, h = 0;
+    for (const s of [scale, 450 / 72, 300 / 72]) {
+      try {
+        const viewport = page.getViewport({ scale: s });
+        const cv = document.createElement('canvas');
+        cv.width = Math.round(viewport.width);
+        cv.height = Math.round(viewport.height);
+        const ctx = cv.getContext('2d');
+        // 白背景を敷く（PDF が透過だと二値化が壊れる）。
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, cv.width, cv.height);
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        id = ctx.getImageData(0, 0, cv.width, cv.height);
+        w = cv.width; h = cv.height;
+        break;
+      } catch (e) { /* 解像度を落として再試行 */ }
+    }
+    if (id) out.push({ data: id.data, width: w, height: h });
   }
   return out;
 }
@@ -236,16 +260,28 @@ document.getElementById('go').addEventListener('click', async () => {
   if (okPages.length === 0) {
     info.className = 'info err';
     const why = results.map((r, i) => `page${i + 1}: ${describeFailure(r)}`).join('\n');
-    info.textContent = '復元に失敗しました。スキャン品質（300dpi・二値・正面）をご確認ください。\n' + why;
+    info.textContent = '復元に失敗しました。スキャン品質（二値・正面・等倍）をご確認ください。\n' +
+      '拡張密度（ver15〜20）のカードは 600dpi 以上での取り込みが必須です。\n' + why;
     return;
   }
 
   // 複数ページ結合。
+  //  §D: 最終ページは版が違う（小さい）ことがあるが、assembleFile は
+  //  pageIndex 順に payloadLen だけ詰めるので混在版でもそのまま結合できる。
   const asm = CF.assembleFile(okPages);
   let data = asm.data;
   if (!data) {
     info.className = 'info err';
-    info.textContent = 'ページの結合に失敗しました（ページ抜け？）。';
+    info.textContent = 'ページの結合に失敗しました（読めたページがありません）。';
+    return;
+  }
+  // ページ欠番の明示（「一部しか復元できていない」を成功と誤認させない）。
+  if (asm.missingPages && asm.missingPages.length) {
+    info.className = 'info err';
+    info.textContent =
+      `ページが足りません（全 ${asm.totalPages} ページ中 ${asm.pagesFound} ページのみ読取）。\n` +
+      `不足しているページ: ${asm.missingPages.map(i => i + 1).join(', ')}\n` +
+      `全ページの画像をまとめて選んでください。`;
     return;
   }
 
@@ -262,10 +298,13 @@ document.getElementById('go').addEventListener('click', async () => {
   restored = { data, name: (okPages[0].meta && okPages[0].meta.name) || 'sncr2_restored.bin' };
   info.className = 'info ok';
   const corr = okPages.reduce((s, r) => s + (r.corrected || 0), 0);
+  // §E: ECC は 8 段階なので固定配列でなく ECC_LEVELS から名称を引く。
+  const eccLbl = (CF.ECC_LEVELS[okPages[0].eccLevel] || {}).label || okPages[0].eccLevel;
+  // §D: ページで版が混在し得るので、読めた版を列挙する。
+  const vers = [...new Set(okPages.map(r => 'ver' + r.version))].join('/');
   info.textContent =
-    `復元成功 ✅ ${data.length} バイト ${note}\n` +
-    `ページ ${okPages.length}/${images.length}・訂正セル合計 ${corr}・` +
-    `ver${okPages[0].version}/ECC${['なし','低','中','高'][okPages[0].eccLevel]}。`;
+    `復元成功 ✅ ${data.length} バイト（${(data.length / 1024).toFixed(1)}KB）${note}\n` +
+    `ページ ${okPages.length}/${images.length}・訂正セル合計 ${corr}・${vers}/ECC${eccLbl}。`;
   document.getElementById('dl').disabled = false;
 });
 

@@ -58,6 +58,29 @@
   // これ未満へは踏み込まない（力技での縮小禁止）。
   const MIN_CELL_MM = 0.7;
 
+  // ---- 拡張版（ver15 以降）用の下限 --------------------------------
+  //  §2-1 の 0.7mm は「300dpi 印刷・300dpi スキャン」を暗黙の前提にした
+  //  実用下限である（0.7mm = 8.27px/セル）。容量目標を 10KB から 15〜20KB へ
+  //  引き上げるには、同じ箱（2152×3096px 固定）をさらに細分するしかないため、
+  //  0.7mm を割る密度が必要になる。
+  //
+  //  そこで下限を「1 段階」だけ緩めた拡張ティアを設ける。ただし力技の縮小に
+  //  しないため、次の条件をセットで課す（これが 0.7mm 下限の実質的な代替）:
+  //    (1) 印刷解像度を 600dpi 以上にする（creator の DPI 倍率＝renderScale）。
+  //        0.52mm セルでも 600dpi なら 12.4px/セルとなり、300dpi での 0.7mm
+  //        （8.27px/セル）より **むしろ高精細** に印刷できる。
+  //    (2) 読み取りも 600dpi スキャンを推奨（等倍・正面・平面固定）。
+  //    (3) UI 上で「拡張密度（要 600dpi）」であることを明示する。
+  //  つまり拡張ティアは「セルを小さくして無理を通す」のではなく、
+  //  「印刷/読取解像度を上げてセル当たり画素数を確保したうえで小さくする」。
+  //
+  //  MIN_CELL_EXT_MM = 0.50mm は 600dpi で 11.8px/セルに相当し、300dpi の
+  //  0.7mm（8.27px/セル）より余裕がある。これを拡張ティアの硬い下限とする。
+  const MIN_CELL_EXT_MM = 0.50;
+
+  // 拡張ティアで推奨する印刷/スキャン解像度（dpi）。
+  const EXT_RECOMMENDED_DPI = 600;
+
   // ---- 四隅ファインダ中心座標（全バージョン共通・旧 cardloader 踏襲）
   // §2-0: スキャナ前提だが、旧 cardloader の四隅検出ロジックを活かすため
   //       ファインダ位置は据え置き。中央部・周辺部の歪み補正は §3 の
@@ -90,6 +113,22 @@
     return cellSize(cols, rows).minCellMm >= MIN_CELL_MM - 1e-9;
   }
 
+  // cols x rows が拡張ティアの下限（0.50mm・600dpi 前提）を満たすか。
+  function meetsMinCellExt(cols, rows) {
+    return cellSize(cols, rows).minCellMm >= MIN_CELL_EXT_MM - 1e-9;
+  }
+
+  // ある cols x rows が要求する最小印刷/スキャン解像度(dpi)。
+  //  「1 セルあたり最低 minPxPerCell 画素」を確保するのに必要な dpi を返す。
+  //  300dpi・0.7mm セル（= 8.27px/セル）を基準の実用ラインとみなし既定 8。
+  //  実際の印刷機・スキャナは 300 の整数倍が扱いやすいので 300 刻みへ切り上げる。
+  function requiredDpi(cols, rows, minPxPerCell) {
+    const need = minPxPerCell != null ? minPxPerCell : 8;
+    const minMm = cellSize(cols, rows).minCellMm;
+    const dpi = need * 25.4 / minMm;   // minMm*dpi/25.4 >= need
+    return Math.max(DPI, Math.ceil(dpi / 300) * 300);
+  }
+
   // 箱のアスペクト比（縦長）。長方形バージョン体系設計の基準。
   //   GRID_H / GRID_W = 3096 / 2152 ≈ 1.4387
   const GRID_ASPECT = GRID_H / GRID_W;
@@ -100,9 +139,12 @@
     GRID_X, GRID_Y, GRID_W, GRID_H,
     GRID_ASPECT,
     MM_PER_PX, MIN_CELL_MM,
+    MIN_CELL_EXT_MM, EXT_RECOMMENDED_DPI,
     pxToMm,
     finderCenters,
     cellSize,
     meetsMinCell,
+    meetsMinCellExt,
+    requiredDpi,
   };
 });

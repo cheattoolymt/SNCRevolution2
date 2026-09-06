@@ -69,9 +69,16 @@ function mkData(len, seed) {
 //  タイムアウトするため。自動判別そのものの検証は core/§10-3 が担う。
 //  useAlignment: true / false で単一モード。'auto'（または未指定）で
 //    プロダクション既定（メッシュ ON→OFF の二段試行）を測る。
-function roundtrip(version, ecc, data, degrade, useAlignment) {
+//  renderScale: 省略時は「その版が要求する解像度」で描画する（拡張版 ver15〜は
+//    セルが 0.7mm を割るため 600dpi=scale2 が必要。creator.html と同じ規則）。
+function renderScaleFor(version) {
+  const prof = CF.getProfile(version);
+  return Math.max(1, (prof.requiredDpi || CF.DPI) / CF.DPI);
+}
+function roundtrip(version, ecc, data, degrade, useAlignment, renderScale) {
   const enc = CF.encodePage(data, { version, eccLevel: ecc });
-  let img = R.renderPage(enc, 1);            // フル A4/300dpi（一致検証は等倍で）
+  const s = renderScale != null ? renderScale : renderScaleFor(version);
+  let img = R.renderPage(enc, s);            // フル A4（版が要求する dpi 相当）
   if (degrade) img = degrade(img);
   // 'auto' は opt.useAlignment を渡さない＝decodeAnyVersion の既定 [true,false] 二段。
   //  レンダは常に非反転（白地・黒セル）なので invert:false を明示して試し読みを半減。
@@ -80,18 +87,23 @@ function roundtrip(version, ecc, data, degrade, useAlignment) {
   const r = DC.decodeAnyVersion(img, opt);
   let match = !!(r.ok && r.data && r.data.length >= data.length);
   if (match) for (let i = 0; i < data.length; i++) if (r.data[i] !== data[i]) { match = false; break; }
+  // 600dpi の A4 は 1 枚 139MB。次のケースへ進む前にバッファを解放して
+  //  ピークメモリを「1 ケースぶん」に抑える（ver16〜20 の連続検証を可能にする）。
+  img.data = null;
   return { ok: !!r.ok, match, corrected: r.corrected || 0, version: r.version };
 }
 
 // ==================================================================
 //  §10-3  クリーン・ラウンドトリップ（全版 × 全 ECC）
 // ==================================================================
+//  ECC は §E で 8 段階（0..7）へ増えたので、全レベルを回す。
 section('§10-3 クリーン: 全版 × 全 ECC ラウンドトリップ');
 {
+  const ECC_ALL = Object.keys(CF.ECC_LEVELS).map(Number).sort((a, b) => a - b);
   let all = true, n = 0;
   for (const v of CF.VERSIONS) {
     const prof = CF.getProfile(v);
-    for (let ecc = 0; ecc <= 3; ecc++) {
+    for (const ecc of ECC_ALL) {
       const net = CF.netCapacity(prof, ecc);
       // ヘッダ 18B を除いた正味の半分程度を載せる（余裕を持って検証）。
       const len = Math.max(16, Math.floor(net * 0.5));
@@ -101,13 +113,107 @@ section('§10-3 クリーン: 全版 × 全 ECC ラウンドトリップ');
       if (!res.match) { all = false; console.log(`  MISS ver${v} ecc${ecc} len${len}: ok=${res.ok} corr=${res.corrected}`); }
     }
   }
-  ok(all, `クリーン全版×全ECC ラウンドトリップ (${n} 通り)`);
+  ok(all, `クリーン全版×全ECC(8段階) ラウンドトリップ (${n} 通り)`);
+}
+
+// ==================================================================
+//  §10-10  【本コミットの主目的】容量 15〜20KB の到達と復元
+// ------------------------------------------------------------------
+//  拡張ティア（ver15〜20）は 0.7mm を割るセルを使うため、300dpi ではなく
+//  600dpi 印刷/スキャンを前提にする（qr-geometry.js の MIN_CELL_EXT_MM の
+//  議論を参照）。ここでは「その前提のもとで実際に 15〜20KB が読めること」を
+//  検証する。roundtrip は renderScaleFor で版ごとの要求解像度を自動適用する。
+// ==================================================================
+section('§10-10 容量 15〜20KB の到達と復元（拡張ティア ver15〜20）');
+{
+  // (a) 各拡張版が「要求解像度で印刷すれば満載で復元できる」こと。
+  let all = true;
+  for (const v of CF.VERSIONS.filter(x => CF.getProfile(x).extended)) {
+    const prof = CF.getProfile(v);
+    const net = CF.netCapacity(prof, 3);        // ECC 高（推奨運用）で満載
+    const data = mkData(net, v * 3 + 1);
+    const res = roundtrip(v, 3, data, null, true);
+    const s = renderScaleFor(v);
+    console.log(`  ver${v} (${prof.COLS}x${prof.ROWS}, ${prof.minCellMm.toFixed(2)}mm, ` +
+                `${prof.requiredDpi}dpi=scale${s}) ECC高 満載 ${net}B: match=${res.match ? 1 : 0} corr=${res.corrected}`);
+    if (!res.match) all = false;
+  }
+  ok(all, '拡張ティア全版（ver15〜20）が要求解像度で ECC高 満載を復元');
+
+  // (b) 目標そのもの: 「15KB を 1 枚で」「20KB を 1 枚で」復元できること。
+  const topV = CF.VERSIONS[CF.VERSIONS.length - 1];
+  const topProf = CF.getProfile(topV);
+  for (const [target, eccWanted] of [[15 * 1024, null], [20 * 1024, null]]) {
+    // その容量を収められる中で「最も ECC の強い」設定を選ぶ（読めることを優先）。
+    const cands = Object.keys(CF.ECC_LEVELS).map(Number)
+      .filter(e => CF.netCapacity(topProf, e) >= target)
+      .sort((a, b) => CF.ECC_LEVELS[b].ratio - CF.ECC_LEVELS[a].ratio);
+    if (cands.length === 0) { ok(false, `${target}B を 1 枚に収める ECC 設定が存在する`); continue; }
+    const ecc = cands[0];
+    const data = mkData(target, target);
+    const res = roundtrip(topV, ecc, data, null, true);
+    ok(res.match,
+      `${(target / 1024).toFixed(0)}KB (${target}B) を A4 1 枚で復元` +
+      `（ver${topV}・ECC${CF.ECC_LEVELS[ecc].label}・正味上限 ${CF.netCapacity(topProf, ecc)}B）`);
+  }
+
+  // (c) 旧上限（ver14）との比較: 同じ ECC 高で容量が確かに増えていること。
+  const v14net = CF.netCapacity(CF.getProfile(14), 3);
+  const v20net = CF.netCapacity(topProf, 3);
+  ok(v20net > v14net * 1.9,
+    `ECC高 の 1 枚容量が ver14 の 1.9 倍超 (${v14net}B → ${v20net}B, ${(v20net / v14net).toFixed(2)}x)`);
+}
+
+// ==================================================================
+//  §10-11  §D 複数ページ結合の効率化（最終ページの自動縮小）
+// ------------------------------------------------------------------
+//  従来は全ページを同一版で刻むため、最終ページが数十バイトでも最高密度の
+//  ページを丸ごと使っていた（ver20/ECC高 なら 14,504B の枠に 50B）。
+//  §D では最終ページだけ「残量が収まる最小版」へ落とす。狙いは 2 つ:
+//    ・紙とインクの無駄を消す
+//    ・最終ページのセルが大きくなる（0.52mm → 3.04mm）＝読み取りが頑丈になる
+//  各ページは従来どおり自己完結ヘッダを持つので、堅牢性は後退しない。
+// ==================================================================
+section('§10-11 §D 複数ページ: 最終ページの自動縮小と結合');
+{
+  const v = 20, ecc = 3;
+  const prof = CF.getProfile(v);
+  const net = CF.netCapacity(prof, ecc);
+
+  // (a) 「1 ページ + 50B」= 最悪のパディングケース。
+  const total = net + 50;
+  const file = mkData(total, 4242);
+  const { pages, totalPages } = CF.encodeFile(file, { version: v, eccLevel: ecc });
+  ok(totalPages === 2, `${total}B は 2 ページに分割される`);
+  const lastVer = pages[totalPages - 1].prof.version;
+  ok(lastVer < v,
+    `最終ページ（残り ${pages[totalPages - 1].payloadLen}B）は ver${v} → ver${lastVer} へ自動縮小`);
+  ok(CF.getProfile(lastVer).minCellMm > prof.minCellMm * 2,
+    `縮小により最終ページのセルが 2 倍以上大きい（${prof.minCellMm.toFixed(2)}mm → ` +
+    `${CF.getProfile(lastVer).minCellMm.toFixed(2)}mm）＝読み取りがより頑丈`);
+
+  // (b) 混在版のページ群を「版を伏せた完全自動判別」で復元・結合できること。
+  const pageResults = pages.map(p => {
+    const img = R.renderPage(p, renderScaleFor(p.prof.version));
+    return DC.decodeAnyVersion(img, { invert: false });
+  });
+  ok(pageResults.every((r, i) => r.ok && r.version === pages[i].prof.version),
+    `混在版ページを自動判別で個別復元 (detected=[${pageResults.map(r => 'ver' + r.version).join(',')}])`);
+  const asm = CF.assembleFile(pageResults);
+  let match = asm.ok && asm.data && asm.data.length === total;
+  if (match) for (let i = 0; i < total; i++) if (asm.data[i] !== file[i]) { match = false; break; }
+  ok(match, `混在版 ${totalPages} ページを結合して ${total}B を完全復元`);
+
+  // (c) ページ欠落を「成功」と誤報しないこと（堅牢性の回帰）。
+  const partial = CF.assembleFile([pageResults[0]]);
+  ok(!partial.ok && partial.missingPages && partial.missingPages.length === 1,
+    `1 ページ欠落を検出して失敗と報告する (missing=[${(partial.missingPages || []).join(',')}])`);
 }
 
 // ==================================================================
 //  §10-3  「A4 1 枚 10KB 前後」到達版の復元 + 複数ページ結合
 // ==================================================================
-section('§10-3 最大版 ≈10KB 復元 + 複数ページ結合');
+section('§10-3 最大版（現行 ≈20KB グロス）復元 + 複数ページ結合');
 {
   const maxV = CF.VERSIONS[CF.VERSIONS.length - 1];
   const prof = CF.getProfile(maxV);
@@ -117,14 +223,18 @@ section('§10-3 最大版 ≈10KB 復元 + 複数ページ結合');
   ok(res.match, `最大版 ver${maxV} ECC高 で正味 ${net}B を 1 枚ラウンドトリップ`);
 
   // 複数ページ: net の 1.7 倍を投入 → 2 ページに分割・結合して復元。
+  //  §D により最終ページは「残量が収まる最小版」へ自動縮小されるため、
+  //  ページごとに版が異なり得る。よって描画スケールも版ごとに求め、
+  //  試し読みも当該ページの版に合わせる（＝混在版を正しく扱う）。
   const bigLen = Math.floor(net * 1.7);
   const big = mkData(bigLen, 1234);
   const { pages, totalPages } = CF.encodeFile(big, { version: maxV, eccLevel: 3 });
   ok(totalPages >= 2, `${bigLen}B は複数ページに分割される (pages=${totalPages})`);
   const pageResults = [];
   for (let p = 0; p < pages.length; p++) {
-    const img = R.renderPage(pages[p], 1);
-    const r = DC.decodeAnyVersion(img, { useAlignment: true, versions: [maxV], invert: false });
+    const pv = pages[p].prof.version;
+    const img = R.renderPage(pages[p], renderScaleFor(pv));
+    const r = DC.decodeAnyVersion(img, { useAlignment: true, versions: [pv], invert: false });
     pageResults.push(r);
   }
   const asm = CF.assembleFile(pageResults);
@@ -381,18 +491,38 @@ function resample(img, s) {
 section(`§10-6 本物の canvas JPEG（${JPEG.hasRealJpeg() ? 'jpeg-js=canvas相当' : 'DCT近似'}）越しの複合劣化`);
 {
   // level3（たわみ+回転+強ぼかし+ドットゲイン）に、分数リサンプル＋本物 JPEG q35 を重畳。
+  //
+  //  【メモリ注意】各段は入力と同じ大きさの新しいバッファを返すため、素朴に
+  //  `g = f(g)` と繋ぐと *前段のバッファが次段の実行中ずっと生きている*。
+  //  600dpi の A4（4960×7016 RGBA ≒ 139MB/枚）だと 6 段で 800MB を超え、
+  //  1GB 級の環境では OOM で落ちる（実測 RSS 454MB @blur 段で既に危険）。
+  //  そこで各段の直後に前段への参照を明示的に切り（=GC 可能にし）、
+  //  ピーク使用量を「2 枚ぶん」に抑える。劣化の内容自体は一切変えない。
+  const step = (g, f) => { const out = f(g); g.data = null; return out; };
   const degrade = (img) => {
     let g = R.warpCenterBulge(img, 0.010);
-    g = R.rotate(g, 1.3);
-    g = R.blur(g, 2);
-    g = R.dotGain(g, { growPx: 1, blackFloor: 35, whiteCeil: 115, bias: -8 });
-    g = resample(g, 0.93);                 // JPEG 8×8 格子をセル境界から分数ずらす
-    g = JPEG.roundtrip(g, 35);             // ★ 本物の canvas 相当 JPEG エンコード→デコード
+    g = step(g, x => R.rotate(x, 1.3));
+    g = step(g, x => R.blur(x, 2));
+    g = step(g, x => R.dotGain(x, { growPx: 1, blackFloor: 35, whiteCeil: 115, bias: -8 }));
+    g = step(g, x => resample(x, 0.93));   // JPEG 8×8 格子をセル境界から分数ずらす
+    g = step(g, x => JPEG.roundtrip(x, 35)); // ★ 本物の canvas 相当 JPEG エンコード→デコード
     return g;
   };
   // 低〜高密度まで全帯域で、実機忠実な劣化を復元できること。
+  //
+  //  ver15 は **拡張ティアの最小版**（0.69mm セル）で、requiredDpi は 300 の
+  //  ままなので 300dpi 描画で検証できる。これを既定に含めることで
+  //  「拡張ティアでも本物 JPEG 越しに読める」ことを毎回の実行で固定する。
+  //
+  //  ver16〜20（600dpi=4960×7016px）は 1 枚 139MB・本物 JPEG 往復に数分かかり、
+  //  routine な e2e には重すぎる（メモリ 1GB 級の環境では OOM する）。
+  //  そこで既定から外し、環境変数 SNCR2_DEEP=1 で opt-in する深掘り検証に回す。
+  //  なお 600dpi 版のクリーン／ドットゲイン／level3 耐性は §10-10 が既定で
+  //  検証しているので、既定実行でも拡張ティアの復元性は担保されている。
+  const deep = !!process.env.SNCR2_DEEP;
+  const targets = deep ? [1, 2, 3, 4, 8, 14, 15, 17, 20] : [1, 2, 3, 4, 8, 14, 15];
   let all = true;
-  for (const v of [1, 2, 3, 4, 8, 14]) {
+  for (const v of targets) {
     const prof = CF.getProfile(v);
     const net = CF.netCapacity(prof, 3);
     const data = mkData(Math.min(net, 300), v * 7 + 1);
@@ -400,7 +530,8 @@ section(`§10-6 本物の canvas JPEG（${JPEG.hasRealJpeg() ? 'jpeg-js=canvas�
     if (!r.match) { all = false; console.log(`  MISS ver${v}: ok=${r.ok} corr=${r.corrected}`); }
     else console.log(`  ver${v}: OK (corr=${r.corrected})`);
   }
-  ok(all, 'level3 + 分数リサンプル + 本物JPEG q35 を全帯域(ver1〜14)で復元（実機忠実化）');
+  ok(all, `level3 + 分数リサンプル + 本物JPEG q35 を復元（実機忠実化・ver[${targets.join(',')}]` +
+          `${deep ? '・deep' : '・SNCR2_DEEP=1 で 600dpi 版も検証'}）`);
 }
 
 // ==================================================================

@@ -14,9 +14,33 @@
  *     [3]     pageIndex   (0-based)
  *     [4]     totalPages
  *     [5..6]  このページの有効ペイロード長 (big-endian 16bit)
- *     [7..10] ファイル全体のバイト数 (big-endian 32bit)
+ *     [7]     flags（旧: totalFileLen BE32 の最上位バイト。後述の理由で転用）
+ *     [8..10] ファイル全体のバイト数 (big-endian 24bit, 最大 16MiB)
  *     [11]    checksum = XOR of bytes[0..10]
  *   論理 12byte を RS(nsym=6) で保護 → 物理 18byte（§4-(e) と一致）。
+ *
+ * ── §C/§E byte[7] を flags へ転用（ヘッダを増やさず ECC を 8 段階へ）──
+ *   §E「ECC 率の可変化」で ECC レベルを 4 段階 → 8 段階（5/10/15/20/25/30/40%
+ *   と なし）へ増やすには 3bit 必要だが、byte[2] の ECC フィールドは 2bit しか
+ *   無く、byte[2] のビット割り当てを変えると **既存カードが読めなくなる**
+ *   （version と ECC の境界がずれる）。
+ *
+ *   そこで「ヘッダを 1byte も増やさずに」3bit 目を確保するため、byte[7] を
+ *   flags バイトへ転用する。安全な理由:
+ *     ・byte[7] は totalFileLen(BE32) の最上位バイト＝ファイルサイズの
+ *       2^24(16MiB) 以上の桁を表す。
+ *     ・しかし本形式の物理上限は 255 ページ × 約 20KB ≒ 5MiB であり、
+ *       16MiB 以上のファイルはそもそも符号化できない。
+ *     ・したがって **既存カードの byte[7] は必ず 0x00** である。
+ *   よって「byte[7]==0 なら旧来と完全に同じ意味（flags 無し）」となり、
+ *   旧カードは 1bit の互換性も損なわずに読める。totalFileLen は BE24
+ *   （最大 16MiB）へ縮小するが、上記のとおり実用上の制約にならない。
+ *
+ *   flags のビット割り当て:
+ *     bit0 … eccLevel の bit2（eccLevel = (byte[2]>>6 の 2bit) | (bit0<<2)）
+ *     bit1 … continuation（§D: 2 ページ目以降で totalPages/totalFileLen を
+ *             1 ページ目から継承してよいことを示す。復号側の整合チェック用）
+ *     bit2..7 … 予約（0 固定）
  *
  * ── byte[2] の再設計（§7「modeId は bit 数を再設計してよい」に基づく）──
  *   旧 cardloader の byte[2] は version_tag(2bit) + modeId(4bit) + ecc(2bit)
@@ -61,7 +85,14 @@
   const HEADER_LEN = HEADER_DATA_LEN + HEADER_NSYM; // 物理 18byte
 
   const VERSION_MASK = 0x3f; // byte[2] 下位 6bit = version
-  const ECC_SHIFT = 6;       // byte[2] 上位 2bit = eccLevel
+  const ECC_SHIFT = 6;       // byte[2] 上位 2bit = eccLevel の下位 2bit
+
+  // §C/§E: byte[7] = flags（旧 totalFileLen BE32 の最上位バイト。上のコメント参照）
+  const FLAG_BYTE = 7;
+  const FLAG_ECC_BIT2 = 0x01;      // bit0: eccLevel の bit2
+  const FLAG_CONTINUATION = 0x02;  // bit1: §D 継承ページ（2 ページ目以降）
+  // totalFileLen は BE24（byte[8..10]）＝最大 16MiB。
+  const MAX_TOTAL_FILE_LEN = 0xffffff;
 
   // ------------------------------------------------------------------
   //  論理ヘッダ(12byte)を組み立てる。checksum まで含めて返す。
@@ -74,21 +105,30 @@
       totalPages = 1,
       payloadLen = 0,
       totalFileLen = 0,
+      continuation = false,
     } = fields || {};
 
     const h = new Uint8Array(HEADER_DATA_LEN);
     h[0] = MAGIC0;
     h[1] = MAGIC1;
-    // byte[2] = version(6bit) | eccLevel(2bit)
+    // byte[2] = version(6bit) | eccLevel の下位 2bit
     h[2] = (version & VERSION_MASK) | ((eccLevel & 0x03) << ECC_SHIFT);
     h[3] = pageIndex & 0xff;
     h[4] = totalPages & 0xff;
     h[5] = (payloadLen >> 8) & 0xff;   // BE16 上位
     h[6] = payloadLen & 0xff;          // BE16 下位
-    h[7] = (totalFileLen >>> 24) & 0xff; // BE32
-    h[8] = (totalFileLen >>> 16) & 0xff;
-    h[9] = (totalFileLen >>> 8) & 0xff;
-    h[10] = totalFileLen & 0xff;
+    // byte[7] = flags（eccLevel の bit2 と continuation）。
+    //  ECC が 0..3（従来レベル）かつ continuation でなければ 0 になり、
+    //  旧仕様と 1bit も違わないヘッダになる（後方互換）。
+    let flags = 0;
+    if (eccLevel & 0x04) flags |= FLAG_ECC_BIT2;
+    if (continuation) flags |= FLAG_CONTINUATION;
+    h[7] = flags;
+    // byte[8..10] = totalFileLen BE24（最大 16MiB。実用上の制約にならない）。
+    const tfl = Math.min(totalFileLen, MAX_TOTAL_FILE_LEN);
+    h[8] = (tfl >>> 16) & 0xff;
+    h[9] = (tfl >>> 8) & 0xff;
+    h[10] = tfl & 0xff;
     let x = 0;
     for (let i = 0; i < 11; i++) x ^= h[i];
     h[11] = x; // checksum = XOR of bytes[0..10]
@@ -110,15 +150,21 @@
   // ------------------------------------------------------------------
   function interpretLogical(h, checksumOk) {
     const verByte = h[2];
+    const flags = h[FLAG_BYTE];
+    // eccLevel = byte[2] 上位 2bit（下位 2bit）＋ flags bit0（bit2）。
+    //  旧カードは flags==0 なので eccLevel 0..3 に一致する（後方互換）。
+    const eccLevel = ((verByte >> ECC_SHIFT) & 0x03) | ((flags & FLAG_ECC_BIT2) ? 0x04 : 0);
     return {
       magicOk: h[0] === MAGIC0 && h[1] === MAGIC1,
       version: verByte & VERSION_MASK,
-      eccLevel: (verByte >> ECC_SHIFT) & 0x03,
+      eccLevel,
       pageIndex: h[3],
       totalPages: h[4],
       payloadLen: (h[5] << 8) | h[6],
-      // BE32 は 32bit 符号なし。h[7] は 2^24 倍で乗算し符号化を避ける。
-      totalFileLen: (h[7] * 0x1000000) + (h[8] << 16) + (h[9] << 8) + h[10],
+      flags,
+      continuation: !!(flags & FLAG_CONTINUATION),
+      // BE24（byte[8..10]）。最大 16MiB。
+      totalFileLen: (h[8] << 16) + (h[9] << 8) + h[10],
       checksumOk,
     };
   }
@@ -166,6 +212,7 @@
     MAGIC0, MAGIC1,
     HEADER_DATA_LEN, HEADER_NSYM, HEADER_LEN,
     VERSION_MASK, ECC_SHIFT,
+    FLAG_BYTE, FLAG_ECC_BIT2, FLAG_CONTINUATION, MAX_TOTAL_FILE_LEN,
     // 関数
     buildLogical,
     buildHeader,

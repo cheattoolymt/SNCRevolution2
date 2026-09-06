@@ -58,11 +58,39 @@
 
   // バージョン表: cols を等差で増やす。旧 cardloader の 10 段階
   // (77x109 〜 239x344) を包含しつつ、より細かい刻みで版を用意する。
-  // すべて 0.7mm 下限を満たす範囲。最終版で ~10KB グロスに到達させる。
-  const VERSION_COLS = [
+  //
+  // ── 標準ティア（ver1〜14）: 300dpi・セル >= 0.7mm ──────────────
+  //   §2-1 の 0.7mm 下限を満たす範囲。最終版 ver14 で ~10KB グロス。
+  //   この 14 版の cols/rows・アライメント密度・レイアウトは **凍結** する
+  //   （既に印刷済みのカードを読めなくしないため）。
+  const VERSION_COLS_STD = [
     60, 77, 90, 108, 120, 132, 145, 160, 175, 190,
     205, 220, 235, 250,
   ];
+
+  // ── 拡張ティア（ver15〜20）: 600dpi 推奨・セル >= 0.50mm ────────
+  //   容量目標を 15〜20KB へ引き上げるための追加版。同じ箱（2152×3096px）を
+  //   さらに細分するので 0.7mm を割るが、Geo.MIN_CELL_EXT_MM(0.50mm) を硬い
+  //   下限とし、印刷/スキャンを 600dpi 以上にする前提で「セル当たり画素数」は
+  //   300dpi/0.7mm（8.27px）より **多く** 確保する（qr-geometry.js の議論参照）。
+  //   さらに §C のアライメント物理間隔一定化でオーバーヘッドが 6.8%→約 3〜4%
+  //   に下がるので、セル数増加ぶんがほぼ丸ごと容量になる。
+  //
+  //   目標（ECC 高・約 30% で）:
+  //     ver15 (265x381): グロス ≈ 11.8KB  → 素の指示どおりの試算どおり
+  //     ver16 (280x403): グロス ≈ 13.4KB
+  //     ver17 (296x426): グロス ≈ 15.0KB → **ECC 高でも 10KB 超**
+  //     ver18 (312x449): グロス ≈ 16.7KB
+  //     ver19 (330x475): グロス ≈ 18.7KB → **ECC 低で 15KB 超**
+  //     ver20 (348x501): グロス ≈ 20.8KB → **ECC なしで 20KB 到達**
+  const VERSION_COLS_EXT = [
+    265, 280, 296, 312, 330, 348,
+  ];
+
+  const VERSION_COLS = VERSION_COLS_STD.concat(VERSION_COLS_EXT);
+
+  // 標準ティアの版数（この境界より大きい version は拡張ティア）。
+  const STD_VERSION_COUNT = VERSION_COLS_STD.length; // 14
 
   // ==================================================================
   // §4-(b) 物理オーバーヘッドのセル数モデル
@@ -95,15 +123,18 @@
     // 平均実効 24 セル/個として近似（nayuki の 25 から重なり分を控除）。
     const alignment = aln * 24;
 
-    // フォーマット情報（ECC レベル+マスク）2 コピー。QR 準拠の固定近似。
+    // フォーマット情報（ECC レベル+マスク）2 コピー = 30 セル + dark module 1。
     const format = 31;
 
-    // バージョン情報 bit（QR は version>=7 で 2x18）。独自版でも
-    // 大版の版数識別に同等の領域を確保する（固定近似 36）。
-    const versionInfo = 36;
-
-    const fn = finder + timing + alignment + format + versionInfo;
-    return { total, finder, timing, alignment, format, versionInfo, functionModules: fn };
+    // §C オーバーヘッド削減: 「バージョン情報 bit」領域を廃止した。
+    //  以前はここに QR 準拠の 2x18=36 セルを見込んでいたが、SNCR2 は
+    //  そもそも版数専用 bit を **盤面に置いていない**（qr-core.buildFunctionGrid
+    //  は予約していない）。版数は §7 ヘッダ byte[2] の 6bit と、復号側の
+    //  「全版試し読み（cols×rows が合う版を採用）」で確定するため、盤面に
+    //  重複して持つ必要がない。モデルだけが実体より 36 セル悲観的だったので、
+    //  実装に合わせて削除する（＝実測との誤差が縮み、容量表が正確になる）。
+    const fn = finder + timing + alignment + format;
+    return { total, finder, timing, alignment, format, versionInfo: 0, functionModules: fn };
   }
 
   // 生データセル数（＝機能モジュールを除いた、データ+ECC に使えるセル数）。
@@ -120,19 +151,47 @@
   //   4 段階: なし / 低≈10% / 中≈20% / 高≈30%。
   //   1 ブロックあたりのパリティ nsym = round(255*ratio) を偶数へ丸め。
   // ==================================================================
+  //   ── §E ECC 率の可変化・細分化 ─────────────────────────────────
+  //   従来は 4 段階（なし/10%/20%/30%）しかなく、刻みが粗いため
+  //     ・「なし」と「低(10%)」の間が飛びすぎる（スキャナ前提なら 5% で足りる
+  //       場面が多いのに、10% 払うか 0% で無保護かの二択だった）
+  //     ・高密度版で「30% では足りないが選べない」上限もあった
+  //   という無駄・不足があった。そこで 5% 刻み + 40% を加えた 8 段階へ拡張する。
+  //
+  //   ★ 重要（後方互換）: level 0..3 の意味（なし/10%/20%/30%）は **一切変えない**。
+  //     既存カードのヘッダ byte[2] 上位 2bit はそのまま正しく解釈できる。
+  //     追加分は 4..7 に「後付け」する（並び順は率の昇順ではないが、互換優先）。
+  //     UI では ratio でソートして表示するのでユーザ体験上の不整合はない。
   const BLOCK_N = 255; // GF(256) 上のブロック長上限
   const ECC_LEVELS = {
-    0: { key: 'none', label: 'なし',        ratio: 0.00 },
-    1: { key: 'low',  label: '低(約10%)',   ratio: 0.10 },
-    2: { key: 'med',  label: '中(約20%)',   ratio: 0.20 },
-    3: { key: 'high', label: '高(約30%)',   ratio: 0.30 },
+    // --- 従来の 4 段階（wire 互換のため番号固定）---
+    0: { key: 'none', label: 'なし',         ratio: 0.00 },
+    1: { key: 'low',  label: '低(約10%)',    ratio: 0.10 },
+    2: { key: 'med',  label: '中(約20%)',    ratio: 0.20 },
+    3: { key: 'high', label: '高(約30%)',    ratio: 0.30 },
+    // --- §E 追加の細粒度レベル（ヘッダ v2 が必要）---
+    4: { key: 'vlow', label: '極低(約5%)',   ratio: 0.05 },
+    5: { key: 'lomed',label: '低中(約15%)',  ratio: 0.15 },
+    6: { key: 'medhi',label: '中高(約25%)',  ratio: 0.25 },
+    7: { key: 'max',  label: '最大(約40%)',  ratio: 0.40 },
   };
+  // 従来ヘッダ（byte[2] の 2bit）で表現できる ECC レベルの上限。
+  //  これを超えるレベルはヘッダ v2（qr-header.js の MAGIC "ND"）が必要。
+  const ECC_LEGACY_MAX = 3;
+
   function eccNsym(eccLevel) {
     const lv = ECC_LEVELS[eccLevel] || ECC_LEVELS[0];
     if (lv.ratio <= 0) return 0;
     let n = Math.round(BLOCK_N * lv.ratio);
     if (n % 2) n++;
     return n;
+  }
+
+  // ECC レベルを「率の昇順」で並べたリスト（UI 表示用）。
+  function eccLevelsByRatio() {
+    return Object.keys(ECC_LEVELS)
+      .map(k => Object.assign({ level: +k }, ECC_LEVELS[k]))
+      .sort((a, b) => a.ratio - b.ratio);
   }
 
   // ==================================================================
@@ -188,11 +247,24 @@
     const fm = functionModuleCount(cols, rows);
     const gross = payloadGrossBytes(cols, rows);
     const overheadPct = fm.functionModules / fm.total;
+    const version = index + 1;              // 1-based（旧 QR と同じ流儀）
+    const extended = version > STD_VERSION_COUNT;
+    // 各 ECC レベル（8 段階）での正味容量。key でも level 番号でも引ける。
+    const net = {};
+    for (const k of Object.keys(ECC_LEVELS)) {
+      net[ECC_LEVELS[k].key] = netPayload(cols, rows, +k);
+    }
     return {
-      version: index + 1, // 1-based（旧 QR と同じ流儀）
+      version,
       cols, rows,
+      // ティア情報（拡張版は 600dpi 推奨・0.50mm 下限）。
+      extended,
+      tier: extended ? 'ext' : 'std',
       cellWmm: cell.cellWmm, cellHmm: cell.cellHmm, minCellMm: cell.minCellMm,
       meetsMinCell: cell.minCellMm >= Geo.MIN_CELL_MM - 1e-9,
+      meetsMinCellExt: cell.minCellMm >= Geo.MIN_CELL_EXT_MM - 1e-9,
+      // その版で「1 セル 8px 以上」を確保するのに必要な印刷/スキャン dpi。
+      requiredDpi: Geo.requiredDpi(cols, rows, 8),
       totalCells: fm.total,
       functionModules: fm.functionModules,
       overheadPct,
@@ -200,13 +272,8 @@
       headerLen: HEADER_LEN,
       payloadGrossBytes: gross,
       alignCount: Align.alignmentCenters(cols, rows).length,
-      // 各 ECC レベルでの正味容量（KiB=1024 基準）。
-      net: {
-        none: netPayload(cols, rows, 0),
-        low:  netPayload(cols, rows, 1),
-        med:  netPayload(cols, rows, 2),
-        high: netPayload(cols, rows, 3),
-      },
+      alignDensity: Align.defaultDensityFor(cols, rows),
+      net,
     };
   }
 
@@ -222,8 +289,7 @@
 
   // 正味 netBytes を ECC レベル eccLevel で収める最小バージョン。
   function pickVersionForNet(netBytes, eccLevel) {
-    const key = (ECC_LEVELS[eccLevel] || ECC_LEVELS[0]).key === 'none' ? 'none'
-              : ECC_LEVELS[eccLevel].key;
+    const key = (ECC_LEVELS[eccLevel] || ECC_LEVELS[0]).key;
     for (const v of VERSIONS) {
       if (v.net[key] >= netBytes) return v;
     }
@@ -232,14 +298,15 @@
 
   return {
     // 定数
-    BLOCK_N, ECC_LEVELS,
+    BLOCK_N, ECC_LEVELS, ECC_LEGACY_MAX,
     HEADER_DATA_LEN, HEADER_NSYM, HEADER_LEN,
-    VERSION_COLS,
+    VERSION_COLS, VERSION_COLS_STD, VERSION_COLS_EXT, STD_VERSION_COUNT,
     // モデル関数
     makeVersionCols,
     functionModuleCount,
     rawDataBytes,
     eccNsym,
+    eccLevelsByRatio,
     blockPlan,
     payloadGrossBytes,
     netPayload,

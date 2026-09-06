@@ -54,8 +54,10 @@
 <div class="wrap">
   <h1>📇 SNCR2 — カード作成</h1>
   <div class="sub">
-    任意のバイナリ → A4/300dpi の QR 風カード画像に変換して印刷します。<br>
-    <b>推奨: スキャナ読み取り</b>（正面・等倍・300dpi）／ カメラ撮影は非推奨。<br>
+    任意のバイナリ → A4 の QR 風カード画像に変換して印刷します。<br>
+    <b>推奨: スキャナ読み取り</b>（正面・等倍・平面固定）／ カメラ撮影は非推奨。<br>
+    ver1〜14 は <b>300dpi</b>、拡張密度の ver15〜20 は <b>600dpi</b> で印刷・スキャンしてください
+    （A4 1 枚で最大 <b>約 20KB</b>）。<br>
     1 ページの正味容量 <b id="capLbl">—</b>。超える分は自動で複数ページに分割します。
     <a class="homelink" href="decoder.html">→ 読み取り(Decoder)へ</a>
   </div>
@@ -70,14 +72,10 @@
       </div>
       <div>
         <label>③ 誤り訂正（汚れ・かすれ耐性）</label>
-        <select id="ecc">
-          <option value="0">なし（訂正0%・最大容量）</option>
-          <option value="1">低（約10%）</option>
-          <option value="2">中（約20%）</option>
-          <option value="3" selected>高（約30%・推奨）</option>
-        </select>
+        <select id="ecc"></select>
       </div>
     </div>
+    <div class="warn" id="dpiWarn" style="margin-top:10px; display:none;"></div>
     <label class="chk" style="margin-top:10px;"><input type="checkbox" id="compress" checked> 圧縮する（deflate/gzip/brotli/日本語辞書から自動選択・可逆）</label>
     <div class="hint">圧縮は完全可逆で、展開後に元データと一致するか自己検証します。テキストや構造化データで特に効きます。</div>
   </div>
@@ -101,24 +99,57 @@ const Ver = window.SNCR2Version;
 const Core = window.SNCR2Core;
 
 // ---- 版セレクタを埋める ----
+//  拡張ティア（ver15〜）は 0.7mm を割るため、必要な印刷/スキャン解像度を明記する。
 const verSel = document.getElementById('ver');
 CF.VERSIONS.forEach(v => {
   const prof = CF.getProfile(v);
   const o = document.createElement('option');
   o.value = v;
-  o.textContent = `ver${v}（${prof.COLS}×${prof.ROWS}・約${prof.minCellMm.toFixed(2)}mm・グロス${prof.grossBytes}B）`;
-  if (v === CF.VERSIONS[CF.VERSIONS.length - 1]) o.selected = true; // 既定は最大版(≈10KB)
+  const kb = (prof.grossBytes / 1024).toFixed(1);
+  const tag = prof.extended ? `・要${prof.requiredDpi}dpi` : '';
+  o.textContent = `ver${v}（${prof.COLS}×${prof.ROWS}・約${prof.minCellMm.toFixed(2)}mm・${kb}KB${tag}）`;
+  // 既定は「標準ティアの最大版」= ver14（300dpi のまま安全に使える最大容量）。
+  //  拡張版は 600dpi 印刷が前提なので、ユーザが明示的に選ぶ設計にする。
+  if (v === Ver.STD_VERSION_COUNT) o.selected = true;
   verSel.appendChild(o);
 });
 
+// ---- ECC セレクタを埋める（§E: 8 段階・率の昇順）----
+const eccSel = document.getElementById('ecc');
+Ver.eccLevelsByRatio().forEach(lv => {
+  const o = document.createElement('option');
+  o.value = lv.level;
+  const pct = (lv.ratio * 100).toFixed(0);
+  o.textContent = lv.ratio === 0
+    ? 'なし（訂正0%・最大容量）'
+    : `${lv.label}${lv.level === 3 ? '・推奨' : ''}`;
+  if (lv.level === 3) o.selected = true;      // 既定は高(30%)
+  eccSel.appendChild(o);
+});
+
 function updateCap() {
-  const v = +verSel.value, ecc = +document.getElementById('ecc').value;
+  const v = +verSel.value, ecc = +eccSel.value;
   const prof = CF.getProfile(v);
   const net = CF.netCapacity(prof, ecc);
-  document.getElementById('capLbl').textContent = `${net} バイト（ver${v}・ECC${['なし','低','中','高'][ecc]}）`;
+  const eccLabel = (Ver.ECC_LEVELS[ecc] || {}).label || '?';
+  document.getElementById('capLbl').textContent =
+    `${net} バイト（${(net / 1024).toFixed(1)}KB／ver${v}・ECC${eccLabel}）`;
+
+  // 拡張ティアの解像度要件を警告表示（「読めないことを避ける」ための明示）。
+  const warn = document.getElementById('dpiWarn');
+  if (prof.extended) {
+    warn.style.display = '';
+    warn.innerHTML =
+      `⚠ <b>ver${v} は拡張密度</b>（セル約${prof.minCellMm.toFixed(2)}mm）です。` +
+      `<b>${prof.requiredDpi}dpi 以上で印刷・スキャン</b>してください` +
+      `（下の「印刷解像度」は自動で ${prof.requiredDpi}dpi に設定されます）。<br>` +
+      `300dpi のプリンタ/スキャナしか無い場合は ver${Ver.STD_VERSION_COUNT} 以下を選んでください。`;
+  } else {
+    warn.style.display = 'none';
+  }
 }
 verSel.addEventListener('change', updateCap);
-document.getElementById('ecc').addEventListener('change', updateCap);
+eccSel.addEventListener('change', updateCap);
 updateCap();
 
 // ==================================================================
@@ -126,14 +157,30 @@ updateCap();
 //  レイアウト: 四隅ファインダ（塗りつぶし正方形） + データグリッド箱 +
 //  人間可読フッタ。decode-core の四隅検出・箱寸法（§2）と厳密に一致させる。
 // ==================================================================
+//  ── 解像度スケール（拡張ティア対応）─────────────────────────────
+//  拡張版（ver15〜）はセルが 0.7mm を割るため、300dpi のままだと 1 セルが
+//  8px を下回り、プリンタのドット/スキャナの画素にセルが埋もれて読めなくなる。
+//  そこで canvas を prof.requiredDpi 相当へ拡大して描画する（300dpi→600dpi なら
+//  2 倍）。ページの **物理寸法（A4）は不変**で、画素密度だけが上がる。
+//  復号側は「画像を四隅ファインダから正規化」して読むので、解像度が上がっても
+//  そのまま読める（decode-core は px 絶対値に依存しない）。
+function renderScaleFor(prof) {
+  return Math.max(1, (prof.requiredDpi || CF.DPI) / CF.DPI);
+}
+
 function renderPage(enc, footerText) {
   const prof = enc.prof;
+  const s = renderScaleFor(prof);              // 1（300dpi）or 2（600dpi）
   const cv = document.createElement('canvas');
-  cv.width = CF.PAGE_W; cv.height = CF.PAGE_H;
+  cv.width = Math.round(CF.PAGE_W * s);
+  cv.height = Math.round(CF.PAGE_H * s);
   const ctx = cv.getContext('2d');
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, cv.width, cv.height);
   ctx.fillStyle = '#000';
+  // 以降は 300dpi 座標系で記述し、scale で拡大する（レイアウト定義を共有）。
+  ctx.save();
+  ctx.scale(s, s);
 
   // 四隅ファインダ（旧 cardloader と同じ塗りつぶし正方形。連結成分検出用）。
   const half = CF.FINDER / 2;
@@ -144,12 +191,19 @@ function renderPage(enc, footerText) {
   for (const f of finders) ctx.fillRect(f.x - half, f.y - half, CF.FINDER, CF.FINDER);
 
   // データグリッド（黒セルのみ塗る）。
+  //  隣接セルの滲み・重なりを避ける「内側詰め」は、従来 0.5px 固定だったが
+  //  高密度版では 1 セルが 6〜8px しかなく、0.5px 詰め（両側で 1px）が
+  //  セル面積の 25% を削ってしまう。詰め量をセル寸法に比例させる
+  //  （セルの 6%・上限 0.5px）ことで、低密度版は従来と同じ見た目を保ちつつ
+  //  高密度版では黒セルの面積を確保し、スキャン時のコントラストを守る。
   for (let r = 0; r < prof.ROWS; r++) {
     for (let c = 0; c < prof.COLS; c++) {
       if (enc.modules[r * prof.COLS + c]) {
         const rect = CF.cellRect(prof, c, r);
-        // 0.5px 内側に描くと隣接セルの滲み・重なりを避けられる（旧 cardloader 踏襲）。
-        ctx.fillRect(rect.x + 0.5, rect.y + 0.5, rect.w - 1, rect.h - 1);
+        const insetX = Math.min(0.5, rect.w * 0.06);
+        const insetY = Math.min(0.5, rect.h * 0.06);
+        ctx.fillRect(rect.x + insetX, rect.y + insetY,
+                     rect.w - insetX * 2, rect.h - insetY * 2);
       }
     }
   }
@@ -160,6 +214,7 @@ function renderPage(enc, footerText) {
   ctx.textAlign = 'center';
   const footerY = CF.GRID_Y + CF.GRID_H + CF.GAP + CF.FINDER + 40;
   ctx.fillText(footerText, CF.PAGE_W / 2, footerY);
+  ctx.restore();
   return cv;
 }
 
@@ -192,9 +247,11 @@ document.getElementById('go').addEventListener('click', async () => {
   }
 
   const ver = +verSel.value;
-  const ecc = +document.getElementById('ecc').value;
+  const ecc = +eccSel.value;
 
   // §2-1「A4 1 枚を主目標」。指定版に収まらなければ複数ページへ自動分割。
+  //  §D: 最終ページは残量が収まる最小版へ自動で落ちる（紙の無駄を消し、
+  //      かつ最終ページのセルが大きくなるので読み取りも安定する）。
   const { pages, totalPages, perPageNet } = CF.encodeFile(bytes, { version: ver, eccLevel: ecc });
 
   // プレビュー + フルサイズ canvas 生成。
@@ -202,7 +259,8 @@ document.getElementById('go').addEventListener('click', async () => {
   previews.innerHTML = '';
   generatedCanvases = [];
   for (let p = 0; p < pages.length; p++) {
-    const footer = `SNCR2 v${ver} ECC${['N','L','M','H'][ecc]}  page ${p + 1}/${totalPages}  ${file.name}`;
+    const pageVer = pages[p].prof.version;      // §D で最終ページのみ変わり得る
+    const footer = `SNCR2 v${pageVer} ECC${(Ver.ECC_LEVELS[ecc]||{}).key||ecc}  page ${p + 1}/${totalPages}  ${file.name}`;
     const full = renderPage(pages[p], footer);
     generatedCanvases.push(full);
 
@@ -216,10 +274,19 @@ document.getElementById('go').addEventListener('click', async () => {
     previews.appendChild(fig);
   }
 
+  // 印刷/スキャン解像度は「全ページ中で最も高い要求」に合わせる。
+  const needDpi = Math.max(...pages.map(p => p.prof.requiredDpi || CF.DPI));
+  const pageVers = pages.map(p => p.prof.version);
+  const lastNote = (totalPages > 1 && pageVers[totalPages - 1] !== ver)
+    ? `\n最終ページは残り ${pages[totalPages - 1].payloadLen}B だけなので ver${pageVers[totalPages - 1]}` +
+      `（セル約${pages[totalPages - 1].prof.minCellMm.toFixed(2)}mm）へ自動縮小しました（読み取りが更に安定します）。`
+    : '';
   info.textContent =
     `完了。${file.name}（元 ${origLen}B）${compressedNote}\n` +
-    `ver${ver} / ECC${['なし','低','中','高'][ecc]} / 1ページ正味 ${perPageNet}B / 全 ${totalPages} ページ。\n` +
-    `推奨: スキャナで 300dpi・二値（白黒）で読み取ってください。`;
+    `ver${ver} / ECC${(Ver.ECC_LEVELS[ecc]||{}).label||ecc} / 1ページ正味 ${perPageNet}B` +
+    `（${(perPageNet/1024).toFixed(1)}KB） / 全 ${totalPages} ページ。${lastNote}\n` +
+    `⚠ 印刷・スキャンは必ず ${needDpi}dpi 以上・二値（白黒）で行ってください` +
+    `（生成画像は ${needDpi}dpi 相当の ${generatedCanvases[0].width}×${generatedCanvases[0].height}px です）。`;
 
   document.getElementById('dlPng').disabled = false;
   document.getElementById('dlPdf').disabled = (totalPages < 1) || window.__noJsPDF;
@@ -236,6 +303,9 @@ document.getElementById('dlPng').addEventListener('click', () => {
 });
 
 // PDF 保存（全ページを 1 ファイルに）。jsPDF が読めた環境のみ。
+//  PDF のページ枠は常に 300dpi 相当の A4（CF.PAGE_W×PAGE_H）に固定し、
+//  高解像度 canvas はその枠へ「縮小配置」する。こうすると物理寸法は A4 のまま、
+//  埋め込み画像の実画素は 600dpi のまま保たれる（＝拡張版が正しく印刷される）。
 document.getElementById('dlPdf').addEventListener('click', () => {
   if (window.__noJsPDF || !window.jspdf) { alert('PDF 出力は利用できません（PNG 保存を使ってください）。'); return; }
   const { jsPDF } = window.jspdf;

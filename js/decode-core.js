@@ -869,6 +869,105 @@
   }
 
   // ==================================================================
+  //  版の事前推定（セルピッチのスペクトル推定）
+  // ------------------------------------------------------------------
+  //  【なぜ必要か（ver15〜20 追加に伴う実務上の要求）】
+  //  decodeAnyVersion は「全版 × invert 2 通り × メッシュ ON/OFF」を順に
+  //  試すので、コストは版数に比例する。版が 14 → 20 に増え、しかも増えた版は
+  //  1 版あたりのセル数が最大 174,348（ver20）と重いため、素朴な全探索では
+  //  自動判別が実測 18 秒に達した（ブラウザでは体感で「固まった」に見える）。
+  //
+  //  そこで「まず正解の版を当てて 1 番目に試す」前処理を入れる。版が違えば
+  //  **セルピッチ（1 セルの px 幅）が違う** ので、データ領域の輝度プロファイルの
+  //  周期を測れば版を絞れる。QR の「タイミングパターンで格子ピッチを測る」の
+  //  一般化にあたる。
+  //
+  //  実装: タイミングパターン（6 行目 / 6 列目の白黒交互ライン）に沿って
+  //  輝度を並べ、その符号反転回数から周期を推定する。交互ラインは
+  //  「1 セルごとに必ず反転」するので、反転回数 ≒ セル数となり、これが
+  //  そのまま cols / rows の推定値になる（他のどんなデータ列よりも直接的）。
+  //  推定が外れても **候補の順序を変えるだけ** で、全版フォールバックは
+  //  そのまま残す（正しさは一切犠牲にしない・速度のみの最適化）。
+  //
+  //  返り値: { cols, rows } の推定値（推定不能なら null）。
+  // ==================================================================
+  function estimateGridPitch(img, corners, invert) {
+    // タイミングラインは「データグリッド箱の 6 セル目」に走る。版が不明なので
+    //  セル数も不明だが、箱の四隅は既知＝正規化座標 (u,v) は使える。
+    //  ピッチ推定には「箱の中央付近を横断/縦断する走査線」で十分（タイミング
+    //  ラインの正確な位置は版依存なので、まず箱全体の周期性を測る）。
+    const H = GEO.computeHomography(corners);
+    const map = (u, v) => H ? GEO.applyHomography(H, u, v) : GEO.bilinearMap(corners, u, v);
+    const gAt = (u, v) => {
+      const p = map(u, v);
+      const x = Math.round(p.x), y = Math.round(p.y);
+      if (x < 0 || y < 0 || x >= img.width || y >= img.height) return 255;
+      let g = grayAt(img, x, y);
+      return invert ? 255 - g : g;
+    };
+
+    // 1 本の走査線（axis='u' で横断／'v' で縦断）から周期を推定する。
+    //  N 点等間隔サンプル → 平均で二値化 → ゼロ交差数から「箱に入るセル数」を出す。
+    //  データ領域はランダムなので反転は「セル境界の一部」でしか起きないが、
+    //  統計的には反転数 ≈ セル数 × (隣接セルが異色になる確率 ≒ 0.5) となる。
+    //  マスク後のデータは白黒ほぼ等確率なのでこの近似が安定して効く。
+    const estimateAxis = (axis, lines) => {
+      const N = 4096;                 // 走査線あたりのサンプル数（十分な過剰標本）
+      const ests = [];
+      for (const t of lines) {
+        const vals = new Float32Array(N);
+        for (let k = 0; k < N; k++) {
+          const s = (k + 0.5) / N;
+          vals[k] = axis === 'u' ? gAt(s, t) : gAt(t, s);
+        }
+        let mean = 0;
+        for (let k = 0; k < N; k++) mean += vals[k];
+        mean /= N;
+        // ゼロ交差（＝白黒の切り替わり）を数える。ノイズ由来の微小交差を
+        //  除くため、平均から一定以上離れた点のみを「確定した色」とみなす。
+        let amp = 0;
+        for (let k = 0; k < N; k++) amp += Math.abs(vals[k] - mean);
+        amp /= N;
+        if (amp < 4) continue;                     // コントラスト不足の走査線は棄却
+        const hys = amp * 0.5;                     // ヒステリシス幅
+        let cur = 0, crossings = 0;
+        for (let k = 0; k < N; k++) {
+          const d = vals[k] - mean;
+          if (cur >= 0 && d < -hys) { cur = -1; crossings++; }
+          else if (cur <= 0 && d > hys) { cur = 1; crossings++; }
+        }
+        if (crossings < 8) continue;
+        // 反転数 ≈ セル数 * 0.5 → セル数 ≈ crossings * 2。
+        ests.push(crossings * 2);
+      }
+      if (ests.length === 0) return 0;
+      ests.sort((a, b) => a - b);
+      return ests[ests.length >> 1];               // 中央値（外れ走査線に強い）
+    };
+
+    // 箱内部の複数ラインで測って中央値を取る（局所的な一様領域を避ける）。
+    const lines = [0.2, 0.35, 0.5, 0.65, 0.8];
+    const cols = estimateAxis('u', lines);
+    const rows = estimateAxis('v', lines);
+    if (!cols && !rows) return null;
+    return { cols, rows };
+  }
+
+  // 推定セル数に近い順へ版候補を並べ替える（全版は残す＝正しさは不変）。
+  function orderVersionsByPitch(versions, est) {
+    if (!est) return versions;
+    const score = (v) => {
+      const prof = CF.getProfile(v);
+      // 推定は統計的なので相対誤差で評価する（cols/rows 両方の平均）。
+      let s = 0, n = 0;
+      if (est.cols) { s += Math.abs(prof.COLS - est.cols) / prof.COLS; n++; }
+      if (est.rows) { s += Math.abs(prof.ROWS - est.rows) / prof.ROWS; n++; }
+      return n ? s / n : 0;
+    };
+    return versions.slice().sort((a, b) => score(a) - score(b));
+  }
+
+  // ==================================================================
   //  全版試し読み（旧 cardloader decodeAnyMode を新 API へ移植）
   // ------------------------------------------------------------------
   //  版ごとに cols×rows でサンプリングし、フォーマット情報 + ヘッダ MAGIC が
@@ -907,7 +1006,17 @@
     for (const invert of inverts) {
       const corners = opt.corners || detectCorners(img, { invert });
       if (!corners) { last = { ok: false, reason: 'no-corners' }; continue; }
-      for (const version of versions) {
+      // 版候補の並べ替え（速度最適化。候補集合そのものは変えない）。
+      //  セルピッチのスペクトル推定で「正解らしい版」を先頭へ持ってくる。
+      //  推定が外れても後続候補で必ず拾えるので、正しさは不変。
+      //  opt.estimatePitch=false で無効化できる（回帰比較用）。
+      let ordered = versions;
+      if (versions.length > 1 && opt.estimatePitch !== false) {
+        try {
+          ordered = orderVersionsByPitch(versions, estimateGridPitch(img, corners, invert));
+        } catch (e) { ordered = versions; }
+      }
+      for (const version of ordered) {
         const prof = CF.getProfile(version);
         for (const useAlignment of alignModes) {
           const modules = sampleModules(img, corners, prof.COLS, prof.ROWS,
@@ -949,6 +1058,8 @@
     buildControlMesh,
     meshMap,
     sampleModules,
+    estimateGridPitch,
+    orderVersionsByPitch,
     decodeAnyVersion,
   };
 });
