@@ -29,10 +29,11 @@
 
 (function (global, factory) {
   'use strict';
-  const mod = factory();
+  const Geo = (typeof require !== 'undefined') ? require('./qr-geometry.js') : global.SNCR2Geometry;
+  const mod = factory(Geo);
   if (typeof module !== 'undefined' && module.exports) module.exports = mod;
   global.SNCR2Align = mod;
-})(typeof window !== 'undefined' ? window : globalThis, function () {
+})(typeof window !== 'undefined' ? window : globalThis, function (Geo) {
   'use strict';
 
   // ------------------------------------------------------------------
@@ -98,14 +99,38 @@
   //   実際のパターン中心は xs×ys の直積。四隅ファインダと重なる
   //   3 箇所（左上・右上・左下）は描画時に除外する（nayuki と同じ規則）。
   // ------------------------------------------------------------------
+  //
+  //   ── 既定密度の決め方（後方互換の要点）─────────────────────────
+  //   opts が空の場合の既定は「その cols×rows の実寸セルから物理間隔
+  //   TARGET_PITCH_MM を満たす density」（= densityForCellSize）。ただし
+  //   **既存 ver1〜14 のレイアウトを 1bit も変えない**ため、既存版の
+  //   cols に対しては従来の DEFAULT_DENSITY(=20) を返す互換テーブルを
+  //   引く（LEGACY_COLS）。これにより既に印刷済みのカードは読めたまま、
+  //   新規の拡張版（ver15 以降）だけがオーバーヘッド削減の恩恵を受ける。
+  // ------------------------------------------------------------------
+
+  // 既存 ver1〜14 の cols（この密度体系は凍結する＝後方互換）。
+  const LEGACY_COLS = new Set([
+    60, 77, 90, 108, 120, 132, 145, 160, 175, 190, 205, 220, 235, 250,
+  ]);
+
+  // cols×rows に対する既定 density（セル単位）を決める。
+  function defaultDensityFor(cols, rows) {
+    if (LEGACY_COLS.has(cols)) return DEFAULT_DENSITY;   // 既存版は従来どおり
+    if (!Geo || !Geo.cellSize) return DEFAULT_DENSITY;
+    const cell = Geo.cellSize(cols, rows);
+    return densityForCellPx(Math.min(cell.cellWpx, cell.cellHpx));
+  }
+
   function alignmentPositions(cols, rows, opts) {
     opts = opts || {};
+    const def = defaultDensityFor(cols, rows);
     const dx = opts.densityX != null ? opts.densityX
              : opts.density  != null ? opts.density
-             : DEFAULT_DENSITY;
+             : def;
     const dy = opts.densityY != null ? opts.densityY
              : opts.density  != null ? opts.density
-             : DEFAULT_DENSITY;
+             : def;
     return {
       xs: axisPositions(cols, dx),
       ys: axisPositions(rows, dy),
@@ -137,8 +162,56 @@
   // より密な「約 20 セルごとに 1 本」を既定とする。
   const DEFAULT_DENSITY = 20;
 
+  // ==================================================================
+  //  §C オーバーヘッド削減: 「補間誤差一定」のアライメント密度
+  // ------------------------------------------------------------------
+  //  DEFAULT_DENSITY=20 は **セル数** での固定間隔なので、密度が上がるほど
+  //  アライメント個数が二次的に増え、オーバーヘッドを押し上げる:
+  //     ver1  (60列・3.04mm/セル):  12 個（ovh 13.1%）
+  //     ver14 (250列・0.73mm/セル): 218 個（ovh 6.8%）
+  //     ver20 (348列・0.52mm/セル): 429 個（ovh 6.5%）… 拡張版では特に重い
+  //
+  //  では何個必要なのか。復号側（decode-core.js）はアライメント中心を制御点に
+  //  した **区分 bilinear メッシュ** で歪みを補正する。滑らかな歪み場 w に対する
+  //  bilinear 補間の残差は、格子間隔 p を使って
+  //        残差[px] ≈ (1/8) * |w''| * p_px²
+  //  でスケールする。一方サンプリングが破綻するかは「残差が何セル分か」で決まる:
+  //        残差[セル] = 残差[px] / cellPx  ∝  p_px² / cellPx
+  //  よって **残差[セル] を版に依らず一定** に保つ条件は
+  //        p_px ∝ sqrt(cellPx)   ⇔   p_cells = p_px/cellPx ∝ 1/sqrt(cellPx)
+  //  となる。つまり密度が上がるほど間隔（セル単位）は **粗く** してよいが、
+  //  粗くできるのは 1/sqrt に比例する分だけ、という中間的な法則になる
+  //  （「セル一定」＝過剰、「物理間隔一定」＝高密度で不足、その間）。
+  //
+  //  基準点は e2e §10-1 で「内部アライメントが確かに効いている」ことを実証
+  //  済みの ver10（190列・cellPx = 2152/190 ≈ 11.3px・density 20）に取る。
+  //        density(cellPx) = 20 * sqrt(11.3 / cellPx)
+  //  これで
+  //   ・低密度版（ver1〜4）  … 20 → 11〜16 と **より密** になり歪み耐性は向上
+  //   ・中密度版（ver10 付近）… 20 のまま（基準点なので不変）
+  //   ・高密度版（ver15〜20）… 24〜27 と粗くなり、個数＝オーバーヘッドが減る
+  //  となり、「補間残差[セル]は一定に保ったままオーバーヘッドだけ削る」。
+  const REF_CELL_PX = 2152 / 190;   // ver10 の 1 セル px（基準点）
+  const REF_DENSITY = 20;           // その版で実証済みの density（セル）
+  // 安全側のクランプ。粗すぎ（>34 セル）は歪み補正が薄くなり、密すぎ（<10 セル）
+  //  はアライメント同士が近接して 5x5 パターンが干渉するため。
+  const DENSITY_MIN = 10;
+  const DENSITY_MAX = 34;
+
+  //  cellPx … 1 セルの画像上の px 数（= GRID_W/cols 相当）。
+  //  返り値: セル数での density（axisPositions が使う単位）。
+  function densityForCellPx(cellPx) {
+    if (!(cellPx > 0)) return DEFAULT_DENSITY;
+    const d = REF_DENSITY * Math.sqrt(REF_CELL_PX / cellPx);
+    return Math.max(DENSITY_MIN, Math.min(DENSITY_MAX, Math.round(d)));
+  }
+
   return {
     DEFAULT_DENSITY,
+    REF_CELL_PX, REF_DENSITY, DENSITY_MIN, DENSITY_MAX,
+    LEGACY_COLS,
+    densityForCellPx,
+    defaultDensityFor,
     axisPositions,
     alignmentPositions,
     alignmentCenters,

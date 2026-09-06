@@ -64,6 +64,11 @@
       dataBytes,                                   // 実測 data 容量（header 含む）
       grossBytes: Math.max(0, dataBytes - Header.HEADER_LEN), // payload グロス
       alignCount: v.alignCount,
+      // 拡張ティア情報（UI が印刷解像度の警告に使う）。
+      extended: v.extended,
+      tier: v.tier,
+      requiredDpi: v.requiredDpi,
+      meetsMinCell: v.meetsMinCell,
     };
   }
   // 版一覧（1-based）。
@@ -191,6 +196,28 @@
   //  fileBytes をバージョン/ECC 固定で複数ページに分割し、
   //  各ページの encodePage 結果を配列で返す。
   // ==================================================================
+  //  ── §D 複数ページ結合の効率化 ───────────────────────────────────
+  //  当初の案は「ヘッダオーバーヘッドを 1 ページ目だけにして 2 ページ目以降を
+  //  純データにする」だったが、実測するとヘッダは 18B ＝ 1 ページの正味に対し
+  //  **0.09%（ver20/ECC なし）〜0.12%（ver20/ECC 高）** しかなく、削っても
+  //  容量はほぼ増えない。しかも 2 ページ目以降からヘッダを消すと
+  //    ・ページ順序が分からなくなる（pageIndex を失う）
+  //    ・そのページ単独では版も ECC も判定できず、復号が 1 ページ目に依存する
+  //    ・1 ページ目を紛失/汚損すると **残り全ページが解読不能** になる
+  //  という重大な堅牢性の後退を招く（「読めないことを避けつつ」に反する）。
+  //
+  //  そこで §D は「ヘッダ削減」ではなく、**実測で桁違いに大きい無駄**である
+  //  「最終ページのパディング」を潰す方向で実装する。従来は全ページを同じ版で
+  //  刻むため、たとえば ver20/ECC 高（1 ページ 14,504B）で 14,554B のファイルを
+  //  焼くと、2 ページ目は 50B のために **14,504B ぶんの最高密度ページ**を
+  //  丸ごと印刷していた（利用率 0.3%）。
+  //
+  //  改善: 最終ページだけ「残りバイト数が収まる最小の版」へ落とす。
+  //    ・紙とインクの無駄が消える（余白が増える）
+  //    ・残り 50B なら ver1（3.0mm セル）になり、最終ページは **むしろ頑丈**に
+  //      なる（セルが 6 倍大きい＝読み取り失敗率が下がる）
+  //    ・各ページは従来どおり自己完結（ヘッダを持つ）なので堅牢性は不変
+  //  opts.autoLastPage=false で従来の「全ページ同一版」に戻せる。
   function encodeFile(fileBytes, opts) {
     opts = opts || {};
     const eccLevel = opts.eccLevel != null ? opts.eccLevel : 3;
@@ -200,32 +227,65 @@
       : getProfile(VERSIONS[VERSIONS.length - 1]);
     const perPageNet = netCapacity(prof, eccLevel);
     const totalPages = Math.max(1, Math.ceil(fileBytes.length / perPageNet));
+    const autoLastPage = opts.autoLastPage !== false;
     const pages = [];
     for (let p = 0; p < totalPages; p++) {
       const start = p * perPageNet;
       const slice = fileBytes.subarray(start, Math.min(start + perPageNet, fileBytes.length));
+      // §D: 最終ページのみ、残りが収まる最小版へ縮める（複数ページのときだけ）。
+      let pageProf = prof;
+      if (autoLastPage && totalPages > 1 && p === totalPages - 1) {
+        const small = pickProfileForNet(slice.length, eccLevel);
+        // 指定版より小さくなる場合のみ採用（大きくは絶対にしない）。
+        if (small.version < prof.version) pageProf = small;
+      }
       pages.push(encodePage(slice, {
-        version: prof.version, eccLevel,
+        version: pageProf.version, eccLevel,
         pageIndex: p, totalPages, totalFileLen: fileBytes.length,
+        // §D: 2 ページ目以降は「1 ページ目から続くページ」であることを明示する。
+        //  ヘッダは各ページに残す（自己完結＝堅牢）が、復号側が
+        //  「単票なのか続きなのか」を 1bit で判定できるようにしておく。
+        continuation: p > 0,
       }));
     }
     return { pages, totalPages, perPageNet, prof, eccLevel };
   }
 
   // 複数ページのデコード結果（decodePageModules の配列）を結合してファイル復元。
+  //  §D: 最終ページは版が違う（小さい）ことがあるため、ページ長を前提にせず
+  //  「pageIndex の順に payloadLen ぶんずつ詰める」方式で結合する。
+  //  さらに、ページの取りこぼし（重複・欠番）を検出して報告する。
   function assembleFile(pageResults) {
-    const oks = pageResults.filter(r => r && r.ok && r.meta);
-    if (oks.length === 0) return { ok: false, data: null };
-    oks.sort((a, b) => a.meta.pageIndex - b.meta.pageIndex);
-    const totalFileLen = oks[0].meta.totalFileLen;
+    const oks = (pageResults || []).filter(r => r && r.ok && r.meta);
+    if (oks.length === 0) return { ok: false, data: null, reason: 'no-page' };
+    // 同じ pageIndex が複数あれば 1 枚だけ採用（同じページを 2 回スキャンした場合）。
+    const byIndex = new Map();
+    for (const r of oks) {
+      const i = r.meta.pageIndex;
+      if (!byIndex.has(i)) byIndex.set(i, r);
+    }
+    const sorted = [...byIndex.values()].sort((a, b) => a.meta.pageIndex - b.meta.pageIndex);
+    const totalFileLen = sorted[0].meta.totalFileLen;
+    const totalPages = sorted[0].meta.totalPages || sorted.length;
+
+    // 欠番ページの検出（0..totalPages-1 が全部そろっているか）。
+    const missing = [];
+    for (let i = 0; i < totalPages; i++) if (!byIndex.has(i)) missing.push(i);
+
     const out = new Uint8Array(totalFileLen);
     let off = 0;
-    for (const r of oks) {
+    for (const r of sorted) {
       const take = Math.min(r.meta.payloadLen, r.data.length, totalFileLen - off);
+      if (take <= 0) continue;
       out.set(r.data.subarray(0, take), off);
       off += take;
     }
-    return { ok: off === totalFileLen, data: out, bytesFilled: off, totalFileLen };
+    return {
+      ok: off === totalFileLen && missing.length === 0,
+      data: out, bytesFilled: off, totalFileLen,
+      totalPages, pagesFound: sorted.length, missingPages: missing,
+      reason: missing.length ? 'missing-pages' : (off === totalFileLen ? undefined : 'short-data'),
+    };
   }
 
   // ==================================================================
@@ -261,6 +321,10 @@
     GRID_X, GRID_Y, GRID_W, GRID_H, MIN_CELL_MM,
     HEADER_LEN: Header.HEADER_LEN,
     VERSIONS,
+    // §E ECC レベル表（8 段階）と §4 の版メタを素通し（UI/テストが参照）。
+    ECC_LEVELS: Ver.ECC_LEVELS,
+    eccLevelsByRatio: Ver.eccLevelsByRatio,
+    STD_VERSION_COUNT: Ver.STD_VERSION_COUNT,
     // プロファイル
     getProfile, netCapacity, pickProfileForNet, cellRect,
     // 高水準 encode/decode

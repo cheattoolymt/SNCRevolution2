@@ -210,18 +210,37 @@ console.log('\n==== §7 ヘッダフォーマット ====');
   check('MAGIC = 0x4E 0x43 ("NC")', Header.MAGIC0 === 0x4e && Header.MAGIC1 === 0x43);
   check('論理 12 + RS 6 = 物理 18', Header.HEADER_DATA_LEN === 12 && Header.HEADER_NSYM === 6 && Header.HEADER_LEN === 18);
 
-  const f = { version: 2, eccLevel: 1, pageIndex: 3, totalPages: 7, payloadLen: 12345, totalFileLen: 0xABCDEF12 };
+  const f = { version: 2, eccLevel: 1, pageIndex: 3, totalPages: 7, payloadLen: 12345, totalFileLen: 0xCDEF12 };
   const log = Header.buildLogical(f);
   check('byte[0..1]=NC', log[0] === 0x4e && log[1] === 0x43);
-  check('byte[2] = version(6bit)|ecc(2bit)', log[2] === ((f.version & 0x3f) | ((f.eccLevel & 3) << 6)));
+  check('byte[2] = version(6bit)|ecc下位2bit', log[2] === ((f.version & 0x3f) | ((f.eccLevel & 3) << 6)));
   check('byte[5..6] = payloadLen BE16', log[5] === ((12345 >> 8) & 0xff) && log[6] === (12345 & 0xff));
-  check('byte[7..10] = totalFileLen BE32',
-    log[7] === 0xAB && log[8] === 0xCD && log[9] === 0xEF && log[10] === 0x12);
+  // §C/§E: byte[7] は flags へ転用（旧 totalFileLen BE32 の最上位バイト）。
+  //  従来 ECC（0..3）かつ非継承ページなら flags=0 → 旧ヘッダとビット一致。
+  check('byte[7] = flags（従来 ECC/非継承なら 0＝旧仕様と一致）', log[7] === 0);
+  check('byte[8..10] = totalFileLen BE24',
+    log[8] === 0xCD && log[9] === 0xEF && log[10] === 0x12);
   let x = 0; for (let i = 0; i < 11; i++) x ^= log[i];
   check('byte[11] = XOR of [0..10]', log[11] === x);
 
   const hdr = Header.buildHeader(f);
   check('buildHeader は 18byte', hdr.length === 18);
+
+  // §E: 拡張 ECC レベル(4..7) は flags bit0 に bit2 が載り、往復で復元される。
+  let extOk = true;
+  for (let lv = 0; lv < 8; lv++) {
+    const g = Object.assign({}, f, { eccLevel: lv });
+    const info = Header.parseHeader(Header.buildHeader(g));
+    if (!info || !info.ok || info.eccLevel !== lv) extOk = false;
+    // flags bit0 が eccLevel bit2 と一致していること。
+    const lg = Header.buildLogical(g);
+    if (((lg[7] & Header.FLAG_ECC_BIT2) ? 4 : 0) !== (lv & 4)) extOk = false;
+  }
+  check('§E: ECC レベル 0..7 が byte[2]+flags で往復する', extOk);
+
+  // §D: continuation フラグの往復。
+  const cont = Header.parseHeader(Header.buildHeader(Object.assign({}, f, { continuation: true })));
+  check('§D: continuation フラグが往復する', !!(cont && cont.ok && cont.continuation === true));
 })();
 
 (function () {
@@ -230,11 +249,13 @@ console.log('\n==== §7 ヘッダフォーマット ====');
   for (let t = 0; t < 2000; t++) {
     const f = {
       version: 1 + Math.floor(rnd() * 63),
-      eccLevel: Math.floor(rnd() * 4),
+      eccLevel: Math.floor(rnd() * 8),   // §E: 8 段階へ拡張
       pageIndex: Math.floor(rnd() * 256),
       totalPages: 1 + Math.floor(rnd() * 255),
       payloadLen: Math.floor(rnd() * 65536),
-      totalFileLen: Math.floor(rnd() * 0xFFFFFFFF),
+      // totalFileLen は BE24（最大 16MiB）。物理上限（255 ページ×約 20KB ≒ 5MiB）
+      //  を十分に上回るので実用上の制約にならない（qr-header.js の議論参照）。
+      totalFileLen: Math.floor(rnd() * 0xFFFFFF),
     };
     const info = Header.parseHeader(Header.buildHeader(f));
     total++;
