@@ -4,6 +4,37 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SNCR2 — カード作成 (Creator)</title>
+<!--
+  SuperNaidesuCardRevolution II (SNCR2) — creator.html
+  ==================================================================
+  実装指示書 §9 の「作成 UI」。任意のバイナリを A4 のカード画像へ焼く。
+
+  ── 画面の流れ ───────────────────────────────────────────────────
+    ① ファイル選択 → ② 密度（独自バージョン）→ ③ 誤り訂正（ECC）
+    → （任意）圧縮 → ④ 生成 → PNG / PDF 保存 → 二値モノクロで印刷
+
+  ── このファイルの責務 ───────────────────────────────────────────
+    1) 版 / ECC セレクタの構築と、選択に応じた正味容量・必要 dpi の表示
+    2) CardFormat.encodeFile()（複数ページ分割まで込み）の呼び出し
+    3) renderPage(): モジュールグリッド → canvas 描画
+       （四隅ファインダ・データグリッド箱・人間可読フッタ。寸法は
+         decode-core の四隅検出／§2 の箱定数と厳密に一致させる）
+    4) PNG 連番保存 / PDF 一括保存（PDF は任意機能）
+
+  ── §8 遵守 ─────────────────────────────────────────────────────
+    ・二値固定（黒セルのみ塗る。中間調は一切データに使わない）
+    ・完全ブラウザ完結・外部送信ゼロ。コアロジックは js/*.js の純粋関数側に
+      あり、このファイルは DOM/Canvas 配線と描画だけを担う。
+    ・実行時依存はローカル同梱の pako.min.js のみ。jsPDF は任意（下記）。
+
+  ── 商標表示 / Trademark notice ───────────────────────────────────
+    QRコードは株式会社デンソーウェーブの登録商標です。
+    QR Code is a registered trademark of DENSO WAVE INCORPORATED in Japan
+    and in other countries.
+    SNCR2 は QR コードの技術的な考え方を参考にした独自フォーマットであり、
+    ISO/IEC 18004 に準拠した QR コードそのものではない。
+    （同じ表示をページ本文の末尾にも掲示している）
+  ================================================================== -->
 <!-- 外部依存は §8 の方針どおり最小限。PDF 出力は任意機能（無くても PNG 保存は動く）。 -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" onerror="window.__noJsPDF=true"></script>
 <!-- SNCR2 コア（すべてローカル・外部送信なし） -->
@@ -89,6 +120,14 @@
     </div>
     <div class="warn" style="margin-top:10px;">⚠ 必ず<b>二値（白黒）</b>でモノクロ印刷してください。グレースケール/カラーは互換性が損なわれます。</div>
     <div class="previews" id="previews"></div>
+  </div>
+
+  <!-- 商標表示（README / index.html と同じ内容を可視領域に掲示）。 -->
+  <div class="sub" style="margin-top:4px;">
+    <small>QRコードは株式会社デンソーウェーブの登録商標です。<br>
+    QR Code is a registered trademark of DENSO WAVE INCORPORATED in Japan and in other countries.<br>
+    本ツールは QR コードの技術的な考え方を参考にした独自フォーマットであり、
+    ISO/IEC 18004 準拠の QR コードそのものではありません。</small>
   </div>
 </div>
 
