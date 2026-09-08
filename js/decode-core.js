@@ -982,8 +982,11 @@
     const inverts = opt.invert != null ? [!!opt.invert] : [false, true];
     // 試し読みする版の集合。既定は全版（＝プロダクションの自動判別）。
     //  opt.versions を渡すと候補版を絞れる（テストや、版が既知の場面で
-    //  全 14 版 × 全面サンプリングの重い試し読みを避けるための任意最適化。
-    //  プロダクションの decoder.html は既定のまま＝全版自動判別を維持する）。
+    //  全 20 版 × 全面サンプリングの重い試し読みを避けるための任意最適化。
+    //  プロダクションの decoder.html は既定のまま＝全版自動判別を維持する。
+    //  この総当たりが「読めない紙を作らない」ための安全網なので、速度目的で
+    //  既定を狭めてはいけない。速度改善は下の orderVersionsByPitch のように
+    //  **候補集合を変えず並べ替えるだけ**の方法で行う）。
     let versions = CF.VERSIONS;
     if (opt.versions != null) {
       const want = Array.isArray(opt.versions) ? opt.versions : [opt.versions];

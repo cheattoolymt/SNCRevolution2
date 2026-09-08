@@ -4,6 +4,39 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SNCR2 — カード読み取り (Decoder)</title>
+<!--
+  SuperNaidesuCardRevolution II (SNCR2) — decoder.html
+  ==================================================================
+  実装指示書 §9 の「読み取り UI」。印刷済みカードのスキャン画像から
+  元ファイルを復元する。creator.html と対になる出口。
+
+  ── 画面の流れ ───────────────────────────────────────────────────
+    画像 / PDF をドロップ（複数可）→ 「復元する」→ 保存
+
+  ── このファイルの責務 ───────────────────────────────────────────
+    1) 画像入力の受け取り（ドロップ / ファイル選択）と canvas 経由の
+       {data, width, height} 化（imageToData / pdfToImageDatas）
+    2) SNCR2DecodeCore.decodeAnyVersion() をページごとに呼ぶ
+       （四隅検出 → 制御点メッシュ → サンプリング → 全版試し読み）
+    3) CardFormat.assembleFile() による複数ページ結合と欠番の明示
+    4) NaidesuCompress.autoDecompress() による自動展開
+    5) describeFailure(): 失敗原因を「利用者が誤認しない文言」へ変換
+       （最重要の区別は「バージョンが確定しているか否か」。詳細は
+         関数直上のコメントと test/decode-message-selftest.js を参照）
+
+  ── §8 遵守 ─────────────────────────────────────────────────────
+    ・復号ロジックは js/decode-core.js ほかの純粋関数側にあり、この
+      ファイルは DOM/Canvas 配線と表示だけを担う。
+    ・完全ブラウザ完結・外部送信ゼロ。PDF 入力は任意機能（下記）。
+
+  ── 商標表示 / Trademark notice ───────────────────────────────────
+    QRコードは株式会社デンソーウェーブの登録商標です。
+    QR Code is a registered trademark of DENSO WAVE INCORPORATED in Japan
+    and in other countries.
+    SNCR2 は QR コードの技術的な考え方を参考にした独自フォーマットであり、
+    ISO/IEC 18004 に準拠した QR コードそのものではない。
+    （同じ表示をページ本文の末尾にも掲示している）
+  ================================================================== -->
 <script src="js/vendor/pako.min.js"></script>
 <script src="js/qr-geometry.js"></script>
 <script src="js/qr-align.js"></script>
@@ -76,6 +109,14 @@ if (!window.__noPdfJs && window.pdfjsLib) {
     <button id="go" disabled>復元する</button>
     <div class="info" id="info"></div>
     <button id="dl" class="ok" disabled style="margin-top:10px;">復元ファイルを保存</button>
+  </div>
+
+  <!-- 商標表示（README / index.html と同じ内容を可視領域に掲示）。 -->
+  <div class="sub" style="margin-top:4px;">
+    <small>QRコードは株式会社デンソーウェーブの登録商標です。<br>
+    QR Code is a registered trademark of DENSO WAVE INCORPORATED in Japan and in other countries.<br>
+    本ツールは QR コードの技術的な考え方を参考にした独自フォーマットであり、
+    ISO/IEC 18004 準拠の QR コードそのものではありません。</small>
   </div>
 </div>
 

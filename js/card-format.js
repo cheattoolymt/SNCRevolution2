@@ -112,9 +112,15 @@
   // ------------------------------------------------------------------
   //  payloadBytes … このページに載せる正味データ（compress 後でも前でも可）。
   //  opts.version  … 明示指定（省略時は payload が収まる最小版）。
-  //  opts.eccLevel … 0..3（§4）。省略時 3（高）。
+  //  opts.eccLevel … 0..7（§4 + §E の 8 段階）。省略時 3（高≈30%）。
+  //                  番号順 ≠ 率順なので注意（0〜3 が旧 4 段階の wire 値、
+  //                  4〜7 が後付けの 5/15/25/40%）。UI は eccLevelsByRatio()。
   //  opts.pageIndex / opts.totalPages / opts.totalFileLen … §7 ヘッダ用。
-  //  返り値: { modules, isFn, cols, rows, mask, eccLevel, prof, header }
+  //  返り値: { modules, isFn, cols, rows, mask, eccLevel, prof, header, payloadLen }
+  //
+  //  ※ payloadBytes がその版・ECC の正味容量を超えた場合、超過分は静かに
+  //     切り捨てられる（例外は投げない）。呼び出し側は netCapacity() で
+  //     事前確認するか、分割まで面倒を見る encodeFile() を使うこと。
   // ==================================================================
   function encodePage(payloadBytes, opts) {
     opts = opts || {};

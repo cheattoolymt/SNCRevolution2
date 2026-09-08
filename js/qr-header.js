@@ -48,18 +48,26 @@
  *   4bit フィールドで、事実上「どのサイズの版か」を表していた。
  *
  *   SNCR2 では「サイズの選択」は §4 の独自バージョン番号
- *   (SNCR2Version.VERSIONS, 現在 14 版) がそのまま担う。したがって
- *   旧 modeId は SNCR2 の version と役割が重複する。冗長な二重管理を
- *   避けるため、byte[2] を次のとおり再設計する:
+ *   (SNCR2Version.VERSIONS, 現行 20 版 = 標準 ver1〜14 + 拡張 ver15〜20)
+ *   がそのまま担う。したがって旧 modeId は SNCR2 の version と役割が
+ *   重複する。冗長な二重管理を避けるため、byte[2] を次のとおり再設計する:
  *
  *       byte[2] = (version & 0x3F) | ((eccLevel & 0x03) << 6)
- *                  └ 下位 6bit: version (1..63)   └ 上位 2bit: eccLevel(0..3)
+ *                  └ 下位 6bit: version (1..63)   └ 上位 2bit: eccLevel の下位 2bit
  *
  *   version に 6bit(=最大 63 版) を割り当てることで、指示書 §7 が懸念する
  *   「新バージョン数が旧 4bit(16) を超える場合」に将来まで余裕をもって
- *   対応できる（現行 14 版、上限 63 版まで拡張可）。ECC は従来どおり 2bit。
- *   MAGIC / pageIndex / totalPages / payloadLen / totalFileLen / checksum
- *   の各フィールドは旧 cardloader と完全に同一。
+ *   対応できる（現行 20 版、上限 63 版まで拡張可）。
+ *
+ *   ECC フィールドはここでは 2bit のままで、8 段階化で必要になった 3bit 目は
+ *   byte[7]（flags）の bit0 へ置いた（上の §C/§E の議論を参照）。したがって
+ *       eccLevel = ((byte[2] >> 6) & 0x03) | ((byte[7] & 0x01) ? 0x04 : 0)
+ *   となる。byte[2] のビット境界を動かさないことが後方互換の要点である
+ *   （動かすと既存カードで version と ECC の境界がずれて読めなくなる）。
+ *
+ *   MAGIC / pageIndex / totalPages / payloadLen / checksum の各フィールドは
+ *   旧 cardloader と完全に同一。totalFileLen だけは byte[7] 転用に伴い
+ *   BE32 → BE24（byte[8..10]・最大 16MiB）へ縮めている。
  *
  * ── 依存 ────────────────────────────────────────────────────────
  *   SNCR2RS (js/qr-rs.js) … ヘッダ専用 RS(nsym=6) 保護（nayuki 統一）
