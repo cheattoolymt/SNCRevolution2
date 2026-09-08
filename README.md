@@ -189,3 +189,5 @@ MIT License — Copyright © 2026 cheattoolymt(nyan4)（全文は [`LICENSE`](./
 > または重要な部分に記載すること）を満たすため、QR コアロジック（`js/qr-core.js`
 > ほか）の移植元である nayuki/QR-Code-generator のライセンス全文を
 > [`LICENSE-THIRD-PARTY.md`](./LICENSE-THIRD-PARTY.md) に転載しています（§11-2）。
+> QRコードは株式会社デンソーウェーブの登録商標です。
+> QR Code is a registered trademark of DENSO WAVE INCORPORATED in Japan and in other countries.
