@@ -107,8 +107,8 @@
       </div>
     </div>
     <div class="warn" id="dpiWarn" style="margin-top:10px; display:none;"></div>
-    <label class="chk" style="margin-top:10px;"><input type="checkbox" id="compress" checked> 圧縮する（deflate/gzip/brotli/日本語辞書から自動選択・可逆）</label>
-    <div class="hint">圧縮は完全可逆で、展開後に元データと一致するか自己検証します。テキストや構造化データで特に効きます。</div>
+    <label class="chk" style="margin-top:10px;"><input type="checkbox" id="compress" checked> 圧縮する（長距離重複・日本語文字面分離を含め自動選択・可逆）</label>
+    <div class="hint">セル寸法や誤り訂正を維持し、圧縮で元データを多く詰め込みます。全体の反復や日本語テキストに有効です。ZIP・暗号化済みデータなどはほぼ縮みません。展開して元データとの完全一致を検証します。</div>
   </div>
 
   <div class="panel">
@@ -292,6 +292,10 @@ document.getElementById('go').addEventListener('click', async () => {
   //  §D: 最終ページは残量が収まる最小版へ自動で落ちる（紙の無駄を消し、
   //      かつ最終ページのセルが大きくなるので読み取りも安定する）。
   const { pages, totalPages, perPageNet } = CF.encodeFile(bytes, { version: ver, eccLevel: ecc });
+  const uncompressedPages = Math.max(1, Math.ceil(origLen / perPageNet));
+  const savingNote = uncompressedPages > totalPages
+    ? `\n同じ版・ECC で圧縮なし ${uncompressedPages} ページ → ${totalPages} ページ（${uncompressedPages - totalPages} 枚削減）。`
+    : '';
 
   // プレビュー + フルサイズ canvas 生成。
   const previews = document.getElementById('previews');
@@ -323,7 +327,7 @@ document.getElementById('go').addEventListener('click', async () => {
   info.textContent =
     `完了。${file.name}（元 ${origLen}B）${compressedNote}\n` +
     `ver${ver} / ECC${(Ver.ECC_LEVELS[ecc]||{}).label||ecc} / 1ページ正味 ${perPageNet}B` +
-    `（${(perPageNet/1024).toFixed(1)}KB） / 全 ${totalPages} ページ。${lastNote}\n` +
+    `（${(perPageNet/1024).toFixed(1)}KB） / 全 ${totalPages} ページ。${savingNote}${lastNote}\n` +
     `⚠ 印刷・スキャンは必ず ${needDpi}dpi 以上・二値（白黒）で行ってください` +
     `（生成画像は ${needDpi}dpi 相当の ${generatedCanvases[0].width}×${generatedCanvases[0].height}px です）。`;
 

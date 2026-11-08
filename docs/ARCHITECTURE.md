@@ -55,7 +55,7 @@
 └───────────────┬──────────────────────────────────────────┘
                 │
 ┌───────────────┴──────────────────────────────────────────┐
-│ 流用層（旧 naidesu-cardloader から無改造）                │
+│ 流用・拡張層（旧 naidesu-cardloader 由来）                │
 │   js/geometry.js          射影変換・適応サンプリング窓     │
 │   js/compress.js          圧縮コンテナ（自動方式選択）     │
 │   js/vendor/pako.min.js   deflate/inflate                  │
@@ -91,8 +91,9 @@ interleave → mask → header → core → card-format）に一致させる必�
    ユーザーのファイル (Uint8Array)
         │
         │  ① 圧縮（任意・可逆）           NaidesuCompress.compress()
-        │     deflate-raw / gzip / brotli / 日本語辞書 deflate / STORE
-        │     から最小のものを選び、6byte のコンテナヘッダを付ける
+        │     deflate-raw / gzip / brotli / 日本語辞書 deflate /
+        │     長距離 LZ + deflate / UTF-8 文字面分離 + deflate / STORE
+        │     から最小かつ完全可逆のものを選び、8byte のヘッダを付ける
         ▼
    payload バイト列
         │

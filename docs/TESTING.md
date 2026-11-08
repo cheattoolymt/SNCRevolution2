@@ -330,7 +330,7 @@ node test/payload-rsfail-diag.js --json   # 機械可読サマリ（1 行 JSON�
 | `card-format.js` | core + **compat** | 全部 |
 | `decode-core.js` | e2e + align + message | 全部 |
 | `geometry.js` | e2e + align | e2e, align |
-| `compress.js` | — | 手動でブラウザ確認（e2e はカバーしない） |
+| `compress.js` | compress + **compat** | ブラウザ確認 + 全部 |
 | `creator.html` の `renderPage` | e2e | e2e, align |
 | `decoder.html` の文言 | message | message |
 | コメント・docs のみ | — | 変更なしを `git diff` で確認 |
@@ -338,6 +338,14 @@ node test/payload-rsfail-diag.js --json   # 機械可読サマリ（1 行 JSON�
 **太字は「落ちたら既存の紙が読めなくなる」テストです。**
 
 ---
+
+### 圧縮容量・互換テスト（`npm run test:compress`）
+
+`test/compress-selftest.js` は Node とネイティブ圧縮 API のないブラウザ相当で、
+任意バイト列・BOM・絵文字の完全一致、従来 method 0〜4（辞書は改修前の固定値）、
+新 method 5/6 の容量改善、破損長・不正参照・展開上限・切断の拒否を検証します。
+さらに圧縮 → 複数ページの盤面/画像 → 自動版判別 → 乱順結合 → 展開まで通します。
+同じ ver14 / ECC30% / セル寸法で紙が減ることも検証します。`npm test` に含まれます。
 
 ## 10. テストを追加するときの作法
 
